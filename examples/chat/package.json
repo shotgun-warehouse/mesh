@@ -1,0 +1,26 @@
+{
+  "name": "shotgun-mesh-chat-example",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start --dev-client",
+    "android": "JAVA_HOME=\"$(/usr/libexec/java_home -v 17)\" GRADLE_JAVA_HOME=\"$(/usr/libexec/java_home -v 17)\" expo run:android",
+    "ios": "expo run:ios",
+    "prebuild": "JAVA_HOME=\"$(/usr/libexec/java_home -v 17)\" expo prebuild",
+    "web": "expo start --web"
+  },
+  "dependencies": {
+    "@shotgun/mesh": "file:../../packages/mesh",
+    "expo": "~56.0.8",
+    "expo-dev-client": "~56.0.18",
+    "expo-device": "~56.0.4",
+    "expo-status-bar": "~56.0.4",
+    "react": "19.2.3",
+    "react-native": "0.85.3"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.2",
+    "typescript": "~6.0.3"
+  }
+}

@@ -1,22 +1,15 @@
 {
   "name": "shotgun-mesh",
-  "version": "1.0.0",
-  "main": "index.ts",
-  "dependencies": {
-    "expo": "~56.0.8",
-    "expo-status-bar": "~56.0.4",
-    "react": "19.2.3",
-    "react-native": "0.85.3"
-  },
-  "devDependencies": {
-    "@types/react": "~19.2.2",
-    "typescript": "~6.0.3"
-  },
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
   "scripts": {
-    "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web"
-  },
-  "private": true
+    "start": "npm run start --workspace=shotgun-mesh-chat-example",
+    "android": "npm run android --workspace=shotgun-mesh-chat-example",
+    "ios": "npm run ios --workspace=shotgun-mesh-chat-example",
+    "prebuild": "npm run prebuild --workspace=shotgun-mesh-chat-example",
+    "typecheck": "npm run typecheck --workspace=@shotgun/mesh"
+  }
 }
