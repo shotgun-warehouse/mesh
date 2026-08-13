@@ -74,11 +74,3 @@ npm run prebuild   # from repo root — runs in examples/chat
 npm run ios        # or npm run android
 npm start
 ```
-
-## Publish SDK
-
-From `packages/mesh`:
-
-```sh
-npm publish --registry <your-private-registry>
-```
