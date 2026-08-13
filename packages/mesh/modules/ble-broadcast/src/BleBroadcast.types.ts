@@ -9,7 +9,7 @@ export type ReceivedMessage = {
   /** BLE link the packet arrived on — used to exclude the sender when gossip-relaying. */
   viaDeviceId: string;
   deviceName: string | null;
-  /** Base64-encoded compact binary mesh wire packet (v2 `SM` format). */
+  /** Base64-encoded compact binary mesh wire packet (`SM` format). */
   jsonMessage: string;
   rssi: number;
   truncated: boolean;

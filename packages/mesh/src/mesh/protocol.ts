@@ -1,9 +1,9 @@
 import { createClientId } from "./clientId";
 import {
-  buildIdentityPacket,
-  buildMessageWirePackets,
-  decodeAnyWirePacket,
-  encodeWirePacket,
+    buildIdentityPacket,
+    buildMessageWirePackets,
+    decodeWirePacket,
+    encodeWirePacket,
 } from "./packets";
 import type { MeshPresence } from "./types";
 
@@ -33,7 +33,7 @@ export function buildChatPayload(
 }
 
 export function parseMeshPayload(wirePayload: string): MeshPresence | null {
-  const packet = decodeAnyWirePacket(wirePayload);
+  const packet = decodeWirePacket(wirePayload);
   if (!packet) {
     return null;
   }

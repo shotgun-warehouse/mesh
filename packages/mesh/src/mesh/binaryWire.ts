@@ -1,19 +1,19 @@
 import {
-  base64ToBytes,
-  bytesToBase64,
-  readUint16BE,
-  readUint32BE,
-  truncateUtf8ToBytes,
-  uuidBytesToString,
-  uuidStringToBytes,
-  writeUint16BE,
-  writeUint32BE,
+    base64ToBytes,
+    bytesToBase64,
+    readUint16BE,
+    readUint32BE,
+    truncateUtf8ToBytes,
+    uuidBytesToString,
+    uuidStringToBytes,
+    writeUint16BE,
+    writeUint32BE,
 } from "./bytes";
 import { MAX_WIRE_BYTES } from "./constants";
 import type { MeshSessionPacket, SessionPacketType } from "./sessionTypes";
 
 export const WIRE_MAGIC = 0x534d; // 'SM'
-export const WIRE_VERSION = 2;
+export const WIRE_VERSION = 1;
 
 export const WIRE_FLAG_HAS_RECIPIENT = 0x01;
 
@@ -275,7 +275,6 @@ export function decodeBinaryWirePacket(
   const payload = bytes.slice(offset, offset + payloadLength);
   const base: MeshSessionPacket = {
     type: "mesh.session",
-    v: 1,
     packetType,
     id: packetId,
     senderId,

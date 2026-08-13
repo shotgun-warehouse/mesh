@@ -4,7 +4,7 @@ export const DEFAULT_TTL = 7;
 /** TTL for periodic identity beacons — enough to propagate across a small mesh. */
 export const IDENTITY_TTL = 4;
 
-export const MESH_PROTOCOL_VERSION = 2;
+export const MESH_PROTOCOL_VERSION = 1;
 
 /** In-memory dedup set size before oldest entries are dropped. */
 export const MAX_SEEN_PACKET_IDS = 500;

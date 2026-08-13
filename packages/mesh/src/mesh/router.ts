@@ -1,21 +1,21 @@
 import BleBroadcast, { type ReceivedMessage } from "../../modules/ble-broadcast";
 import {
-  FRAGMENT_PUBLISH_DELAY_MS,
-  IDENTITY_BEACON_INTERVAL_MS,
-  MAX_SEEN_PACKET_IDS,
-  RELAY_PUBLISH_DELAY_MS,
+    FRAGMENT_PUBLISH_DELAY_MS,
+    IDENTITY_BEACON_INTERVAL_MS,
+    MAX_SEEN_PACKET_IDS,
+    RELAY_PUBLISH_DELAY_MS,
 } from "./constants";
 import { FragmentAssembler } from "./fragments";
 import { meshLog } from "./logger";
 import {
-  buildIdentityPacket,
-  buildMessageWirePackets,
-  buildRelayPacket,
-  createPacketId,
-  decodeAnyWirePacket,
-  encodeWirePacket,
-  type MeshSessionPacket,
-  wirePacketByteLength,
+    buildIdentityPacket,
+    buildMessageWirePackets,
+    buildRelayPacket,
+    createPacketId,
+    decodeWirePacket,
+    encodeWirePacket,
+    type MeshSessionPacket,
+    wirePacketByteLength,
 } from "./packets";
 
 export type MeshIdentityEvent = {
@@ -273,7 +273,7 @@ export class MeshRouter {
   }
 
   private handleIncoming(incomingMessage: ReceivedMessage): void {
-    const packet = decodeAnyWirePacket(incomingMessage.jsonMessage);
+    const packet = decodeWirePacket(incomingMessage.jsonMessage);
     if (!packet) {
       meshLog(
         "receive",

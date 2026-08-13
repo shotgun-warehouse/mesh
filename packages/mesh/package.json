@@ -23,8 +23,7 @@
     "react-native": "*"
   },
   "dependencies": {
-    "@expo/config-plugins": "~55.0.8",
-    "fflate": "^0.8.3"
+    "@expo/config-plugins": "~55.0.8"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

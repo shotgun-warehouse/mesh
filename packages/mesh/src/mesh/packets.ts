@@ -1,17 +1,16 @@
 import {
-  binaryWireByteLength,
-  decodeBinaryWireBase64,
-  encodeBinaryWireBase64,
-  isBinaryWireBase64,
+    binaryWireByteLength,
+    decodeBinaryWireBase64,
+    encodeBinaryWireBase64,
+    isBinaryWireBase64,
 } from "./binaryWire";
 import { createClientId } from "./clientId";
-import { gzipDecodeJson } from "./compression";
 import {
-  DEFAULT_TTL,
-  IDENTITY_TTL,
-  INITIAL_FRAGMENT_CHUNK_BYTES,
-  MAX_WIRE_BYTES,
-  MAX_WIRE_FIT_BYTES,
+    DEFAULT_TTL,
+    IDENTITY_TTL,
+    INITIAL_FRAGMENT_CHUNK_BYTES,
+    MAX_WIRE_BYTES,
+    MAX_WIRE_FIT_BYTES,
 } from "./constants";
 import type { MeshSessionPacket, SessionPacketType } from "./sessionTypes";
 
@@ -28,10 +27,10 @@ export function encodeWirePacket(packet: MeshSessionPacket): string {
 export function decodeWirePacket(
   wirePayload: string,
 ): MeshSessionPacket | null {
-  if (isBinaryWireBase64(wirePayload)) {
-    return decodeBinaryWireBase64(wirePayload);
+  if (!isBinaryWireBase64(wirePayload)) {
+    return null;
   }
-  return decodeLegacyJsonWirePacket(wirePayload);
+  return decodeBinaryWireBase64(wirePayload);
 }
 
 export function wirePacketByteLength(packet: MeshSessionPacket): number {
@@ -61,7 +60,6 @@ export function buildIdentityPacket(
 ): MeshSessionPacket {
   return {
     type: "mesh.session",
-    v: 1,
     packetType: "identity",
     id: packetId,
     senderId,
@@ -83,7 +81,6 @@ export function buildMessagePacket(
 ): MeshSessionPacket {
   return {
     type: "mesh.session",
-    v: 1,
     packetType: "message",
     id: packetId,
     senderId,
@@ -132,7 +129,6 @@ function buildFragmentPacket(
 ): MeshSessionPacket {
   return {
     type: "mesh.session",
-    v: 1,
     packetType: buildFragmentPacketType(fragmentIndex, fragmentCount),
     id: packetId,
     senderId,
@@ -292,129 +288,3 @@ export function buildRelayPacket(
   };
 }
 
-function decodeLegacyJsonWirePacket(
-  wirePayload: string,
-): MeshSessionPacket | null {
-  const jsonPayload = gzipDecodeJson(wirePayload);
-  if (!jsonPayload) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(jsonPayload) as Partial<
-      MeshSessionPacket & { chunk?: string }
-    >;
-    if (
-      parsed.type !== "mesh.session" ||
-      parsed.v !== 1 ||
-      typeof parsed.id !== "string" ||
-      typeof parsed.senderId !== "string" ||
-      typeof parsed.ttl !== "number" ||
-      typeof parsed.ts !== "number" ||
-      !parsed.packetType
-    ) {
-      return null;
-    }
-
-    let chunkBytes: Uint8Array | undefined;
-    if (typeof parsed.chunk === "string") {
-      const binary = atob(parsed.chunk);
-      chunkBytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) {
-        chunkBytes[index] = binary.charCodeAt(index);
-      }
-    }
-
-    return {
-      type: "mesh.session",
-      v: 1,
-      packetType: parsed.packetType,
-      id: parsed.id,
-      senderId: parsed.senderId,
-      recipientId:
-        typeof parsed.recipientId === "string" ? parsed.recipientId : null,
-      ttl: parsed.ttl,
-      ts: parsed.ts,
-      displayName:
-        typeof parsed.displayName === "string" ? parsed.displayName : undefined,
-      messageId:
-        typeof parsed.messageId === "string" ? parsed.messageId : undefined,
-      text: typeof parsed.text === "string" ? parsed.text : undefined,
-      transferId:
-        typeof parsed.transferId === "string" ? parsed.transferId : undefined,
-      fragmentIndex:
-        typeof parsed.fragmentIndex === "number"
-          ? parsed.fragmentIndex
-          : undefined,
-      fragmentCount:
-        typeof parsed.fragmentCount === "number"
-          ? parsed.fragmentCount
-          : undefined,
-      totalBytes:
-        typeof parsed.totalBytes === "number" ? parsed.totalBytes : undefined,
-      chunkBytes,
-    };
-  } catch {
-    return null;
-  }
-}
-
-/** Legacy mesh.presence support for older peers. */
-export function decodeLegacyPresence(
-  wirePayload: string,
-): MeshSessionPacket | null {
-  const jsonPayload = gzipDecodeJson(wirePayload);
-  const candidates = jsonPayload ? [jsonPayload, wirePayload] : [wirePayload];
-
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate) as {
-        type?: string;
-        clientId?: string;
-        displayName?: string;
-        toClientId?: string;
-        messageId?: string;
-        text?: string;
-        ts?: number;
-      };
-
-      if (
-        parsed.type !== "mesh.presence" ||
-        typeof parsed.clientId !== "string"
-      ) {
-        continue;
-      }
-
-      const hasChat =
-        typeof parsed.text === "string" && typeof parsed.messageId === "string";
-
-      return {
-        type: "mesh.session",
-        v: 1,
-        packetType: hasChat ? "message" : "identity",
-        id: hasChat ? parsed.messageId! : createPacketId(),
-        senderId: parsed.clientId,
-        recipientId:
-          typeof parsed.toClientId === "string" ? parsed.toClientId : null,
-        ttl: DEFAULT_TTL,
-        ts: typeof parsed.ts === "number" ? parsed.ts : Date.now(),
-        displayName:
-          typeof parsed.displayName === "string"
-            ? parsed.displayName
-            : undefined,
-        messageId: parsed.messageId,
-        text: parsed.text,
-      };
-    } catch {
-      continue;
-    }
-  }
-
-  return null;
-}
-
-export function decodeAnyWirePacket(
-  wirePayload: string,
-): MeshSessionPacket | null {
-  return decodeWirePacket(wirePayload) ?? decodeLegacyPresence(wirePayload);
-}

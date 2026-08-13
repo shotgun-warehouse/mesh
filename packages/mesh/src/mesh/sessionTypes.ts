@@ -7,7 +7,6 @@ export type SessionPacketType =
 
 export type MeshSessionPacket = {
   type: "mesh.session";
-  v: 1;
   packetType: SessionPacketType;
   /** Unique ID for gossip dedup — preserved across relay hops. */
   id: string;

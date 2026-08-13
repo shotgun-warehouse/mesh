@@ -2,6 +2,8 @@
 
 Monorepo for **`@shotgun/mesh`** — a BLE mesh networking SDK for Expo apps — and a chat example.
 
+Read **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the design rationale: what the mesh is trying to achieve, why it uses GATT writes with a 512-byte binary wire format, what approaches failed along the way, and the known trade-offs.
+
 ## Structure
 
 ```
