@@ -205,7 +205,9 @@ names), folding permission, power, and hardware support into one value, and
 - **iOS** combines the states of the peripheral and central managers (the mesh
   needs both roles). The managers are created lazily, on the first state read,
   so the permission prompt appears when the provider mounts rather than at app
-  launch. `unknown` covers the time the prompt is on screen.
+  launch. `unknown` covers the time the prompt is on screen. Both
+  managers opt out of the system "Turn On Bluetooth" alert: Bluetooth being off
+  only shows up as `poweredOff`, and the app decides what to show.
 - **Android** checks `FEATURE_BLUETOOTH_LE`, the runtime permissions, the
   adapter state, and that the LE advertiser exists (peripheral mode), and
   listens to `ACTION_STATE_CHANGED`. Permission changes have no broadcast;

@@ -352,14 +352,19 @@ public class BleBroadcastModule: Module {
     return meshId
   }
 
+  /// Both managers opt out of the system "Turn On Bluetooth" alert iOS shows when one is created
+  /// while Bluetooth is off: the app gets `poweredOff` through `onBluetoothStateChange` instead and
+  /// decides how to tell the user.
   fileprivate func ensureBluetoothManagers() {
     if peripheralManager == nil {
       peripheralManager = CBPeripheralManager(delegate: peripheralDelegate, queue: nil, options: [
-        CBPeripheralManagerOptionShowPowerAlertKey: true
+        CBPeripheralManagerOptionShowPowerAlertKey: false
       ])
     }
     if centralManager == nil {
-      centralManager = CBCentralManager(delegate: centralDelegate, queue: nil)
+      centralManager = CBCentralManager(delegate: centralDelegate, queue: nil, options: [
+        CBCentralManagerOptionShowPowerAlertKey: false
+      ])
     }
   }
 

@@ -69,7 +69,7 @@ Mount a single `MeshProvider`, near the root: there is one Bluetooth radio. The 
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `starting`          | Bluetooth is usable (or the user is answering the permission prompt) and the mesh is starting.                                                             |
 | `running`           | The mesh is up. `broadcast` works.                                                                                                                         |
-| `bluetooth_off`     | Bluetooth is turned off. The mesh starts by itself once it is turned on.                                                                                   |
+| `bluetooth_off`     | Bluetooth is turned off. iOS shows no system alert for it, so tell the user yourself. The mesh starts by itself once it is turned on.                      |
 | `permission_denied` | The user denied Bluetooth permission. Send them to Settings (`Linking.openSettings()`); the mesh starts when they come back with it granted.               |
 | `unsupported`       | The device has no Bluetooth LE, or cannot advertise (for example the iOS Simulator).                                                                       |
 | `error`             | The mesh failed to start 3 times in a row (retrying after 1 s, then 2 s). `useMesh().error` says why. Toggling Bluetooth or reopening the app tries again. |
