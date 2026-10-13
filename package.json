@@ -1,15 +1,69 @@
 {
-  "name": "shotgun-mesh",
-  "private": true,
-  "workspaces": [
-    "packages/*",
-    "examples/*"
+  "name": "@shotgun/mesh",
+  "version": "0.1.0",
+  "description": "BLE mesh networking SDK for Expo apps",
+  "license": "MIT",
+  "author": "Shotgun",
+  "homepage": "https://github.com/shotgun-warehouse/mesh#readme",
+  "bugs": {
+    "url": "https://github.com/shotgun-warehouse/mesh/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shotgun-warehouse/mesh.git"
+  },
+  "keywords": [
+    "expo",
+    "react-native",
+    "bluetooth",
+    "ble",
+    "mesh",
+    "expo-module"
+  ],
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/index.d.ts",
+      "default": "./build/index.js"
+    },
+    "./plugin": "./app.plugin.js",
+    "./app.plugin.js": "./app.plugin.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "build",
+    "src",
+    "ios",
+    "android",
+    "!android/build",
+    "!android/.gradle",
+    "plugin/build",
+    "app.plugin.js",
+    "expo-module.config.json"
   ],
   "scripts": {
-    "start": "npm run start --workspace=shotgun-mesh-chat-example",
-    "android": "npm run android --workspace=shotgun-mesh-chat-example",
-    "ios": "npm run ios --workspace=shotgun-mesh-chat-example",
-    "prebuild": "npm run prebuild --workspace=shotgun-mesh-chat-example",
-    "typecheck": "npm run typecheck --workspace=@shotgun/mesh"
-  }
+    "build": "tsc -p tsconfig.build.json && tsc -p plugin/tsconfig.json",
+    "clean": "rm -rf build plugin/build",
+    "typecheck": "tsc --noEmit && tsc -p plugin/tsconfig.json --noEmit",
+    "prepare": "pnpm run clean && pnpm run build"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "peerDependencies": {
+    "expo": ">=56",
+    "react": "*",
+    "react-native": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/react": "~19.2.2",
+    "expo": "~57.0.28",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "typescript": "~6.0.3"
+  },
+  "packageManager": "pnpm@12.11.2"
 }

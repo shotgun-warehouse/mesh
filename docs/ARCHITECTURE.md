@@ -29,19 +29,21 @@ flooding, and application-level fragmentation.
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ App (examples/chat, or any Expo app)                      │
-│   MeshProvider / useMesh — React API                      │
+│ App (example/, or any Expo app)                           │
+│   MeshProvider / useMesh / useMeshMessages — React API    │
 ├───────────────────────────────────────────────────────────┤
-│ JS mesh layer (packages/mesh/src/mesh)                    │
+│ JS mesh layer (src/mesh)                                  │
+│   lifecycle.ts  Bluetooth state → start/stop, retries     │
 │   router.ts     gossip, dedup, TTL, send queue            │
 │   packets.ts    packet building, fragmentation sizing     │
 │   binaryWire.ts compact binary wire format                │
 │   fragments.ts  reassembly of fragmented transfers        │
 ├───────────────────────────────────────────────────────────┤
-│ Native BLE module (packages/mesh/modules/ble-broadcast)   │
+│ Native BLE module (ios/, android/, src/native)            │
 │   Android: BleBroadcastModule.kt                          │
 │   iOS:     BleBroadcastModule.swift                       │
-│   scan + advertise + GATT client/server + serial writes   │
+│   Bluetooth state + scan + advertise + GATT client/server │
+│   + serial writes                                         │
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -96,7 +98,8 @@ The current binary format (`binaryWire.ts`) is the first (and only) on-wire
 protocol:
 
 - Magic `SM`, version `1`, type, flags, TTL, uint32 timestamp
-- UUIDs as **16 raw bytes** instead of 36-char strings
+- Sender and recipient as **4-byte device IDs** (see 3.7); packet, message
+  and transfer IDs as **16 raw UUID bytes** instead of 36-char strings
 - Fragment _continue/end_ packets carry only `transferId (16) + index (2) + raw chunk` — metadata like `messageId`/`fragmentCount` travels **only** in
   the _start_ packet
 - Result: same 2.7 KB payload → **7 packets, ~400 B of data each, ~1.2 s**
@@ -137,23 +140,43 @@ deliberately dumb: for ≤8 peers, flooding is simpler and more robust than
 routing. **Fragment packets are not relayed** (single-hop only) — see
 shortcomings.
 
-### 3.7 Identity as a separate concern from links
+### 3.7 Identity: one device ID per install
 
-A BLE link becoming ready and knowing _who_ is on the other end are two
-different events:
+Every install generates a random **device ID** once (`DEVICE_ID_BYTES` = 4
+bytes, 8 hex chars), stored natively outside backups (`noBackupFilesDir` on
+Android, Application Support excluded from backup on iOS) so restoring a
+backup onto a new phone does not clone it. It is the sender and recipient in
+every packet header and the key of the peer list.
 
-- `onPeerConnected` (native) → the peer appears in the UI immediately with its
-  BLE device name (`isIdentified: false`).
-- An **identity packet** (mesh clientId + display name) upgrades the entry
-  (`isIdentified: true`) and enables sending.
+**Why 4 bytes.** The mesh targets an event-sized group (up to ~100 devices).
+A collision is not cosmetic: a device drops every packet carrying its own ID
+as an echo of itself. With 2 bytes, 100 devices collide in ~7% of events; with
+4 bytes, about one in 800,000.
 
-We learned this separation the hard way: an earlier "fast peer list" change
-used the BLE device ID as the mesh clientId, so messages were addressed to
-the BLE address and the recipient **correctly dropped them** ("not addressed
-to this client"). The fix: UI is keyed by stable `bleDeviceId`; routing uses
-the mesh `clientId`, and sends are blocked until identity arrives. Identity
-is also pushed **immediately on link-up** (plus every 5 s) rather than only
-on a 15 s timer.
+**The ID is in the advertisement.** Android advertises it as service data on
+the mesh service; iOS cannot advertise service data, so it puts it in the
+local name (`SM:<id>`). A link is therefore identified the moment it comes up:
+`onPeerConnected` carries the peer's `meshId`. The native layer also skips a
+second connection to a device it already has a link to (Android rotates its
+address, so one phone shows up under several identifiers).
+
+**Why the BLE link identifier cannot be the identity.** We learned this twice:
+
+- An early "fast peer list" used the BLE device ID as the mesh client ID, so
+  messages were addressed to the BLE address and the recipient **correctly
+  dropped them** ("not addressed to this client").
+- Keying the peer list by link identifier produced duplicate rows: iOS sees an
+  Android phone under one identifier when it connects to it and another when
+  the phone connects back, and Android picks a new address when Bluetooth
+  restarts. An anonymous "Connecting…" row could never be matched to the
+  identity that arrived on the other identifier.
+
+**Peer list.** Keyed only by device ID. Identity packets set the announced name
+(the device name unless the app set one), link events the BLE name and RSSI.
+A link whose advertisement lacked the ID (iOS apps in the background drop the
+local name) adds nothing; the peer appears when its identity packet arrives,
+which is pushed **immediately on link-up** (plus every 5 s). A peer is removed
+when the last link this device opened to it disconnects.
 
 ### 3.8 Base64 at the JS↔native bridge
 
@@ -169,6 +192,68 @@ standard `atob`/`btoa`, and truncate UTF-8 strings on **code-point
 boundaries** (`truncateUtf8ToBytes`), never on JS string length.
 **Lesson: never hand-roll base64.**
 
+### 3.9 The provider owns the lifecycle
+
+Apps never call start or stop. Mounting `MeshProvider` creates a `MeshLifecycle`
+(`lifecycle.ts`) that keeps the mesh running whenever Bluetooth allows it.
+
+**Native reports one Bluetooth state.** `getBluetoothStateAsync()` returns
+`poweredOn | poweredOff | unauthorized | unsupported | unknown` (CoreBluetooth's
+names), folding permission, power, and hardware support into one value, and
+`onBluetoothStateChange` fires when it changes:
+
+- **iOS** combines the states of the peripheral and central managers (the mesh
+  needs both roles). The managers are created lazily, on the first state read,
+  so the permission prompt appears when the provider mounts rather than at app
+  launch. `unknown` covers the time the prompt is on screen.
+- **Android** checks `FEATURE_BLUETOOTH_LE`, the runtime permissions, the
+  adapter state, and that the LE advertiser exists (peripheral mode), and
+  listens to `ACTION_STATE_CHANGED`. Permission changes have no broadcast;
+  revoking one kills the app, and granting one is picked up by the foreground
+  refresh below.
+
+**JS turns the state into a status.** The lifecycle re-reads the state on
+mount, on every `onBluetoothStateChange`, and when the app returns to the
+foreground. `poweredOn` starts the session (router first, so it is listening
+before the first peer connects, then advertising, then scanning); anything else
+stops it and maps to `bluetooth_off`, `permission_denied`, `unsupported`, or
+`starting` (for `unknown`). On Android, an `unauthorized` state triggers the
+permission dialog once per app launch.
+
+**Retries.** A failed start is retried after 1 s, then 2 s. After 3 failures in
+a row the status is `error`, with the last native error message. Any later
+Bluetooth state change or app foregrounding starts a new round of 3 attempts, so
+`error` is never a dead end.
+
+**One operation queue for the whole app.** The native module is a singleton, so
+every refresh, start, and stop goes through one module-level promise queue
+shared by all lifecycle instances. A provider that unmounts (including React
+StrictMode's mount → unmount → mount) finishes stopping before the next one
+starts. Callbacks from a router that was already stopped are ignored.
+
+**Power-off is handled natively first.** When Bluetooth stops being usable, the
+native module drops its own runtime state (advertising, scanning, GATT server,
+peer links, in-flight writes) and emits `onPeerDisconnected` for every peer,
+then JS stops the router. CoreBluetooth does not call the disconnect delegate
+when it powers off, so JS cannot rely on per-peer events here.
+
+**Identity survives restarts.** The device ID is per install, and the IDs of
+delivered messages are remembered across mesh restarts (bounded), so a
+Bluetooth toggle neither changes who this device is nor re-delivers messages
+still being flooded.
+
+**Silent failures are caught on refresh.** If Bluetooth resets and comes back
+before the queued refresh runs, the state read is `poweredOn` again while the
+native runtime was wiped. Every refresh with a running session therefore also
+checks `isBroadcastingAsync`/`isScanningAsync` and restarts the session if
+either is false.
+
+**Renaming.** Identity beacons reuse one packet ID per session (so each node
+relays a beacon only once), which means peers would drop a renamed beacon as a
+duplicate. `setDisplayName` gives the identity a new packet ID and publishes it
+immediately. Only identity packets carry the name, so the peer list keeps a
+peer's announced name when chat or link events arrive without one.
+
 ## 4. Platform-specific landmines (encountered and fixed)
 
 These are real behaviors we hit; future changes must not regress them.
@@ -182,6 +267,12 @@ These are real behaviors we hit; future changes must not regress them.
 | iOS      | Emitting to JS synchronously inside the GATT callback delayed the ATT response                                                                          | Respond, then emit async                                                                |
 | iOS      | Writes >512 B via ATT long write work but are fragile                                                                                                   | Avoided entirely by the 512 B packet ceiling                                            |
 | Both     | Two devices connect to each other simultaneously (dual-connect race), producing spurious connect/disconnect cycles                                      | Retry throttle (2 s); ready state only from the GATT-client side on Android             |
+| iOS      | Powering off invalidates every peripheral without calling `didDisconnectPeripheral`, stops advertising, and clears the GATT database                    | Reset all runtime state on any non-`poweredOn` state; emit disconnects ourselves        |
+| iOS      | `stopScan`, `stopAdvertising`, `cancelPeripheralConnection` while not powered on log "API MISUSE"                                                       | Only call them when the manager is `poweredOn`                                          |
+| iOS      | The start promise resolved when the service was added, so an advertising failure was silent                                                             | Resolve in `peripheralManagerDidStartAdvertising`                                       |
+| Android  | `stopScan` and `stopAdvertising` throw `IllegalStateException` once the adapter is off                                                                  | Wrap them in `runCatching`                                                              |
+| Both     | Identity beacons reuse one packet ID, so peers drop a renamed beacon as already seen                                                                    | New identity packet ID on every rename                                                  |
+| Both     | One phone appears under several BLE identifiers (per role on iOS, address rotation on Android)                                                          | Device ID in the advertisement; peers keyed by it; one link per device ID               |
 
 ## 5. What works today
 
@@ -192,6 +283,9 @@ These are real behaviors we hit; future changes must not regress them.
 - Gossip relay with dedup across ≥3 devices for non-fragmented packets
 - Packaged as a reusable SDK (`@shotgun/mesh`) with a config plugin and
   React provider; chat app is just an example consumer
+- Hands-off lifecycle: wrapping the app in `MeshProvider` is enough; the mesh
+  follows Bluetooth permission and power state on its own and reports it as a
+  status
 
 ## 6. Known shortcomings and consciously accepted trade-offs
 
@@ -252,7 +346,9 @@ not private, just filtered.
 - Store-and-forward relay of assembled messages for multi-hop large payloads
 - Encryption (per-mesh pre-shared key would fit the POS use case)
 - Persistent dedup / message store across restarts
-- Advertisement-embedded short client ID for identity-before-connect
+- Liveness for peers several hops away: they are only removed when the mesh
+  stops, because their repeated beacons are deduplicated before anyone sees
+  them (rotating the beacon packet ID every ~30 s would fix it)
 - Adaptive TTL and relay damping if mesh sizes grow past ~8 nodes
 
 ## 9. Glossary
@@ -262,7 +358,7 @@ not private, just filtered.
 | **Packet**          | One ≤512 B wire unit (identity, message, or fragment)                        |
 | **Transfer**        | A fragmented message: 1 start + N continue + 1 end packet                    |
 | **Link**            | A live GATT connection to a directly-reachable peer                          |
-| **Peer**            | A mesh participant, identified by mesh `clientId` (UUID)                     |
-| **Identity beacon** | Periodic packet mapping `clientId` → display name                            |
+| **Peer**            | A mesh participant, identified by its 4-byte device ID                       |
+| **Identity beacon** | Periodic packet mapping device ID → display name                             |
 | **Gossip / relay**  | Re-broadcasting unseen packets on all links except the arrival link, TTL − 1 |
 | **Quiescence**      | Suppressing background traffic while a transfer is active                    |
