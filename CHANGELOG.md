@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+Fixes 0.2.2 on Android, where links to iOS peers never became ready. Native change: needs a new development build.
+
+- **Android:** the GATT cache is no longer cleared on every connect, only on the next connect to a peer whose writes failed with an invalid handle. Clearing it right before discovery made discovery never answer.
+- **Android:** service discovery starts once the MTU exchange is done (1.5 s fallback when `onMtuChanged` never fires), and a refused or unanswered discovery (3 s) is retried up to 4 times. A link not ready 15 s after connecting is dropped.
+
 ## 0.2.2
 
 Android links to iOS peers recover on their own instead of staying dead until Bluetooth is toggled. Native change: needs a new development build.
