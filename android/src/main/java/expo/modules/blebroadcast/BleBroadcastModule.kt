@@ -61,6 +61,14 @@ class BleBroadcastModule : Module() {
   private val lastEmittedJsonByLink = mutableMapOf<String, String>()
   /** Buffers in-progress BLE long writes (prepare-write chunks) keyed by device address. */
   private val preparedWriteBuffers = mutableMapOf<String, ByteArray>()
+  /** Peers whose cached GATT table proved stale (invalid handle): cleared on their next connect. */
+  private val staleGattCacheDeviceIds = mutableSetOf<String>()
+  /**
+   * MTU a peer negotiated when it connected to this GATT server. The ATT MTU belongs to the
+   * connection, which both directions share: with it known, this device's own MTU request is
+   * skipped (iOS can leave it unanswered, which blocks every later GATT operation).
+   */
+  private val serverMtuByDeviceId = mutableMapOf<String, Int>()
   private var lastEmittedBluetoothState: String? = null
   private var cachedMeshId: String? = null
   /** This device's mesh ID, advertised as service data so peers know who we are before connecting. */
@@ -115,6 +123,7 @@ class BleBroadcastModule : Module() {
     var meshCharacteristic: BluetoothGattCharacteristic?,
     var isReady: Boolean = false,
     var isDiscovering: Boolean = false,
+    var discoveryAttempts: Int = 0,
     /** Failed writes in a row on this link; reset by any successful write. */
     var consecutiveWriteFailures: Int = 0,
   )
@@ -183,11 +192,13 @@ class BleBroadcastModule : Module() {
         // characteristic is discovered — avoid premature connect events here.
       } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
         preparedWriteBuffers.remove(device.address)
+        serverMtuByDeviceId.remove(device.address)
         // Disconnect is handled from the GATT client peer lifecycle.
       }
     }
 
     override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+      serverMtuByDeviceId[device.address] = mtu
       meshLog(
         tag = "gattServer",
         message = "Central MTU changed",
@@ -339,8 +350,19 @@ class BleBroadcastModule : Module() {
             message = "Connected to peer",
             detail = mapOf("deviceId" to gatt.device.address, "status" to status),
           )
-          gatt.requestMtu(517)
-          // iOS peripherals often never fire onMtuChanged — do not gate discovery on it.
+          // Only after an invalid handle: a refresh right before discovery made it never answer.
+          if (staleGattCacheDeviceIds.remove(gatt.device.address)) {
+            meshLog(
+              tag = "gattClient",
+              message = "Cleared the stale GATT cache",
+              detail = mapOf(
+                "deviceId" to gatt.device.address,
+                "refreshed" to refreshGattCache(gatt),
+              ),
+            )
+          }
+          // Discovery first, MTU after (`markLinkReady`): an MTU request iOS leaves unanswered
+          // blocks every GATT operation queued behind it, discovery included.
           mainHandler.postDelayed({ discoverMeshServices(gatt) }, MTU_SETTLE_DELAY_MS)
           watchLinkSetup(gatt)
         }
@@ -370,7 +392,7 @@ class BleBroadcastModule : Module() {
           "attPayloadLimit" to AttWriteFragmentation.attPayloadLimit(),
         ),
       )
-      mainHandler.postDelayed({ discoverMeshServices(gatt) }, MTU_SETTLE_DELAY_MS)
+      markLinkReady(gatt)
     }
 
     override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -406,6 +428,32 @@ class BleBroadcastModule : Module() {
       }
 
       peer.meshCharacteristic = characteristic
+      val serverMtu = serverMtuByDeviceId[gatt.device.address]
+      if (serverMtu != null) {
+        markLinkReady(gatt)
+        return
+      }
+      // Writes wait for the MTU (they would be refused while the request is in flight), but not
+      // forever: iOS can leave it unanswered.
+      val requested = gatt.requestMtu(517)
+      meshLog(
+        tag = "gattClient",
+        message = "Requesting MTU",
+        detail = mapOf("deviceId" to gatt.device.address, "requested" to requested),
+      )
+      if (!requested) {
+        markLinkReady(gatt)
+        return
+      }
+      mainHandler.postDelayed({ markLinkReady(gatt) }, MTU_WAIT_MS)
+    }
+
+    /** The mesh characteristic is known and the MTU settled (or given up on): writes can start. */
+    private fun markLinkReady(gatt: BluetoothGatt) {
+      val peer = meshPeers[gatt.device.address] ?: return
+      if (peer.gatt !== gatt || peer.isReady || peer.meshCharacteristic == null) {
+        return
+      }
       peer.isReady = true
       meshLog(
         tag = "gattClient",
@@ -416,6 +464,7 @@ class BleBroadcastModule : Module() {
           "rssi" to peer.rssi,
           "readyPeerCount" to meshPeers.values.count { readyPeer -> readyPeer.isReady },
           "attPayloadLimit" to AttWriteFragmentation.attPayloadLimit(),
+          "serverMtu" to serverMtuByDeviceId[gatt.device.address],
         ),
       )
       emitPeerConnected(peer.deviceId, peer.meshId, peer.deviceName, peer.rssi)
@@ -450,6 +499,9 @@ class BleBroadcastModule : Module() {
         )
         // The link stays "ready" while every write fails (e.g. handles from a stale GATT cache):
         // reconnect so services are discovered again.
+        if (status == ATT_INVALID_HANDLE) {
+          staleGattCacheDeviceIds.add(gatt.device.address)
+        }
         if (status == ATT_INVALID_HANDLE || failures >= MAX_CONSECUTIVE_WRITE_FAILURES) {
           dropMeshPeer(
             gatt.device.address,
@@ -1365,18 +1417,21 @@ class BleBroadcastModule : Module() {
   }
 
   /**
-   * Discovers the mesh service once per connection. The cached GATT table is cleared first: iOS
-   * rebuilds its service on every mesh start, so cached handles can point nowhere
-   * (writes then fail with an invalid handle). `discoverServices` returns false while another
-   * GATT operation (the MTU request) is in flight, so it is retried.
+   * Discovers the mesh service. `discoverServices` returns false while another GATT operation
+   * is in flight, and a started discovery can still get no answer: both are retried, up to
+   * `MAX_DISCOVERY_ATTEMPTS`, then `watchLinkSetup` drops the link.
    */
-  private fun discoverMeshServices(gatt: BluetoothGatt, attempt: Int = 1) {
+  private fun discoverMeshServices(gatt: BluetoothGatt) {
     val peer = meshPeers[gatt.device.address] ?: return
     if (peer.gatt !== gatt || peer.isReady || peer.isDiscovering) {
       return
     }
+    if (peer.discoveryAttempts >= MAX_DISCOVERY_ATTEMPTS) {
+      return
+    }
 
-    val cacheRefreshed = if (attempt == 1) refreshGattCache(gatt) else null
+    peer.discoveryAttempts += 1
+    val attempt = peer.discoveryAttempts
     val started = gatt.discoverServices()
     meshLog(
       tag = "gattClient",
@@ -1385,20 +1440,31 @@ class BleBroadcastModule : Module() {
         "deviceId" to gatt.device.address,
         "attempt" to attempt,
         "started" to started,
-        "cacheRefreshed" to cacheRefreshed,
       ),
       level = if (started) "info" else "warn",
     )
-    if (started) {
-      peer.isDiscovering = true
+    if (!started) {
+      mainHandler.postDelayed({ discoverMeshServices(gatt) }, DISCOVERY_RETRY_DELAY_MS)
       return
     }
-    if (attempt < MAX_DISCOVERY_ATTEMPTS) {
-      mainHandler.postDelayed(
-        { discoverMeshServices(gatt, attempt + 1) },
-        DISCOVERY_RETRY_DELAY_MS,
+
+    peer.isDiscovering = true
+    mainHandler.postDelayed({
+      val currentPeer = meshPeers[gatt.device.address] ?: return@postDelayed
+      if (currentPeer.gatt !== gatt || currentPeer.isReady || !currentPeer.isDiscovering ||
+        currentPeer.discoveryAttempts != attempt
+      ) {
+        return@postDelayed
+      }
+      meshLog(
+        tag = "gattClient",
+        message = "Service discovery got no answer",
+        detail = mapOf("deviceId" to gatt.device.address, "attempt" to attempt),
+        level = "warn",
       )
-    }
+      currentPeer.isDiscovering = false
+      discoverMeshServices(gatt)
+    }, DISCOVERY_ANSWER_TIMEOUT_MS)
   }
 
   /** `BluetoothGatt.refresh()` is hidden but widely used: it drops the cached GATT table. */
@@ -1684,9 +1750,11 @@ class BleBroadcastModule : Module() {
     /** ATT payload limit after MTU 517 negotiation (517 − 3 byte header). */
     private const val MAX_ATT_WRITE_BYTES = 512
     private const val MTU_SETTLE_DELAY_MS = 50L
+    private const val MTU_WAIT_MS = 2_000L
     private const val DISCOVERY_RETRY_DELAY_MS = 500L
-    private const val MAX_DISCOVERY_ATTEMPTS = 5
-    private const val LINK_SETUP_TIMEOUT_MS = 10_000L
+    private const val DISCOVERY_ANSWER_TIMEOUT_MS = 3_000L
+    private const val MAX_DISCOVERY_ATTEMPTS = 4
+    private const val LINK_SETUP_TIMEOUT_MS = 15_000L
     private const val MAX_CONSECUTIVE_WRITE_FAILURES = 3
     /** ATT "Invalid Handle": the characteristic is not where the cached GATT table says. */
     private const val ATT_INVALID_HANDLE = 1
