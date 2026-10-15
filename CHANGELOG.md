@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.3
 
 Fixes 0.2.2 on Android, where links to iOS peers never became ready. Native change: needs a new development build.
 
