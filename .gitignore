@@ -45,3 +45,6 @@ yarn-error.*
 # example app generated native folders
 /example/ios/
 /example/android/
+
+# simulator
+/simulator/dist/

@@ -1,0 +1,15 @@
+{
+  "name": "late-joiner",
+  "description": "Main gate; gate-6 keeps Bluetooth off for 5 minutes (still scanning offline), then joins. Scanning stops when it joins, so convergence has a fixed target.",
+  "seed": 42,
+  "preset": "main-gate",
+  "actions": [
+    { "at": "0s", "do": "powerOff", "device": "gate-6" },
+    { "at": "5m", "do": "powerOn", "device": "gate-6" },
+    { "at": "5m", "do": "setParams", "params": { "scanRatePerMin": 0 } }
+  ],
+  "runUntil": "8m",
+  "expect": {
+    "default": { "lostByProtocol": 0, "convergedWithin": "30s" }
+  }
+}

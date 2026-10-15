@@ -510,13 +510,75 @@ class BleBroadcastModule : Module() {
       isScanning
     }.runOnQueue(Queues.MAIN)
 
-    AsyncFunction("sendPacketAsync") { jsonMessage: String, excludeDeviceId: String?, promise: Promise ->
-      sendPacket(jsonMessage, excludeDeviceId, promise)
+    AsyncFunction("sendPacketAsync") { jsonMessage: String, excludeDeviceId: String?, targetDeviceId: String?, promise: Promise ->
+      sendPacket(jsonMessage, excludeDeviceId, targetDeviceId, promise)
     }.runOnQueue(Queues.MAIN)
 
     AsyncFunction("getConnectedPeerCountAsync") {
       meshPeers.values.count { peer -> peer.isReady }
     }.runOnQueue(Queues.MAIN)
+
+    // Synced items: one append-only file of JSON lines per sync scope (`fileKey` is hex from JS).
+    AsyncFunction("readItemsAsync") { fileKey: String ->
+      synchronized(itemsLock) {
+        val file = itemsFile(fileKey)
+        if (!file.exists()) emptyList() else file.readLines().filter { line -> line.isNotEmpty() }
+      }
+    }
+
+    AsyncFunction("appendItemsAsync") { fileKey: String, lines: List<String> ->
+      synchronized(itemsLock) {
+        if (lines.isNotEmpty()) {
+          itemsFile(fileKey).appendText(lines.joinToString(separator = "\n", postfix = "\n"))
+        }
+      }
+    }
+
+    AsyncFunction("listItemFilesAsync") {
+      synchronized(itemsLock) {
+        val names = itemsDirectory().list() ?: emptyArray()
+        names
+          .filter { name -> name.endsWith(ITEMS_FILE_SUFFIX) }
+          .map { name -> name.removeSuffix(ITEMS_FILE_SUFFIX) }
+      }
+    }
+
+    AsyncFunction("replaceItemsAsync") { fileKey: String, lines: List<String> ->
+      synchronized(itemsLock) {
+        val file = itemsFile(fileKey)
+        if (lines.isEmpty()) {
+          file.delete()
+        } else {
+          // Write aside then rename, so a kill mid-write leaves the old file whole.
+          val tempFile = File(file.parentFile, "${file.name}.tmp")
+          tempFile.writeText(lines.joinToString(separator = "\n", postfix = "\n"))
+          if (!tempFile.renameTo(file)) {
+            tempFile.delete()
+            throw CodedException("ERR_MESH_ITEMS_WRITE", "Could not replace items file", null)
+          }
+        }
+      }
+      Unit
+    }
+  }
+
+  /** Serializes item file access: appends from successive JS calls must not interleave. */
+  private val itemsLock = Any()
+
+  /** `noBackupFilesDir/expo-mesh-items/<fileKey>.jsonl`, never restored onto another phone. */
+  private fun itemsFile(fileKey: String): File {
+    if (fileKey.isEmpty() || !fileKey.all { char -> char in HEX_DIGITS }) {
+      throw CodedException("ERR_MESH_ITEMS_KEY", "Invalid items file key", null)
+    }
+    return File(itemsDirectory(), "$fileKey$ITEMS_FILE_SUFFIX")
+  }
+
+  private fun itemsDirectory(): File {
+    val context = appContext.reactContext
+      ?: throw CodedException("ERR_MESH_ITEMS_CONTEXT", "No React context", null)
+    val directory = File(context.noBackupFilesDir, ITEMS_DIRECTORY_NAME)
+    directory.mkdirs()
+    return directory
   }
 
   /**
@@ -773,7 +835,11 @@ class BleBroadcastModule : Module() {
     pendingStartPromise = null
   }
 
-  private fun sendPacket(jsonMessage: String, excludeDeviceId: String?, promise: Promise) {
+  /**
+   * Writes to every ready link except [excludeDeviceId], or only to the link whose advertised mesh
+   * ID is [targetDeviceId] when it is set.
+   */
+  private fun sendPacket(jsonMessage: String, excludeDeviceId: String?, targetDeviceId: String?, promise: Promise) {
     try {
       ensureBluetoothAdapterReady(requireAdvertiser = false)
       ensureScanPermissions()
@@ -811,6 +877,10 @@ class BleBroadcastModule : Module() {
           continue
         }
 
+        if (targetDeviceId != null && peer.meshId != targetDeviceId.lowercase()) {
+          continue
+        }
+
         val characteristic = peer.meshCharacteristic
         if (characteristic == null) {
           writeQueueFailures += 1
@@ -829,6 +899,7 @@ class BleBroadcastModule : Module() {
           "payloadBytes" to payload.size,
           "wireChars" to jsonMessage.length,
           "excludeDeviceId" to excludeDeviceId,
+          "targetDeviceId" to targetDeviceId,
           "sentCount" to sentCount,
           "readyPeerCount" to readyPeerCount,
           "skippedNotReady" to skippedNotReady,
@@ -1487,6 +1558,8 @@ class BleBroadcastModule : Module() {
     private const val BLUETOOTH_STATE_UNSUPPORTED = "unsupported"
     private const val BLUETOOTH_STATE_UNKNOWN = "unknown"
     private const val MESH_ID_FILE_NAME = "expo-mesh-device-id"
+    private const val ITEMS_DIRECTORY_NAME = "expo-mesh-items"
+    private const val ITEMS_FILE_SUFFIX = ".jsonl"
     private const val HEX_DIGITS = "0123456789abcdef"
   }
 }

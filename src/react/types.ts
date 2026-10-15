@@ -1,3 +1,5 @@
+import type { MeshItem } from "../sync/types";
+
 export type { MeshStatus } from "../mesh/lifecycle";
 
 export type MeshPeer = {
@@ -16,14 +18,5 @@ export type MeshPeer = {
   lastSeen: number;
 };
 
-export type MeshInboundMessage = {
-  /** Unique message ID, the same on every device that receives the message. */
-  id: string;
-  json: string;
-  /** Device ID of the sender; `getPeer(senderId)` gives its name. */
-  senderId: string;
-  /** When the sender sent it (ms since epoch, second precision). */
-  timestamp: number;
-};
-
-export type MeshMessageListener = (message: MeshInboundMessage) => void;
+/** Items this device did not have yet, received from peers (never its own), already saved. */
+export type MeshItemsListener = (items: MeshItem[]) => void;

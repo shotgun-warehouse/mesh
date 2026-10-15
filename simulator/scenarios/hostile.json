@@ -1,0 +1,13 @@
+{
+  "name": "hostile",
+  "description": "25 % write loss, links drop every 30 s on average, apps get killed and Bluetooth toggles. Scanning stops at 4 minutes.",
+  "seed": 3,
+  "preset": "hostile",
+  "actions": [
+    { "at": "4m", "do": "setParams", "params": { "scanRatePerMin": 0 } }
+  ],
+  "runUntil": "7m",
+  "expect": {
+    "default": { "lostByProtocol": 0 }
+  }
+}

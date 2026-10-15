@@ -1,0 +1,22 @@
+{
+  "name": "large-items",
+  "description": "Main gate with 2 KB scans (5 parts each). Compares how far fresh items flood: repair fetches the rest, more cheaply than relaying every part through every phone.",
+  "seed": 5,
+  "preset": "main-gate",
+  "params": { "itemBytes": 2000 },
+  "actions": [
+    { "at": "4m", "do": "setParams", "params": { "scanRatePerMin": 0 } }
+  ],
+  "runUntil": "6m",
+  "variants": {
+    "default": {},
+    "push-2-hops": { "pushHops": 2 },
+    "push-neighbours": { "pushHops": 0 },
+    "no-repair": { "repair": false }
+  },
+  "expect": {
+    "default": { "lostByProtocol": 0, "convergedWithin": "60s" },
+    "push-2-hops": { "lostByProtocol": 0, "convergedWithin": "60s" },
+    "push-neighbours": { "lostByProtocol": 0, "convergedWithin": "60s" }
+  }
+}

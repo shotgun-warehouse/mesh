@@ -1,0 +1,29 @@
+{
+  "name": "mesh-simulator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "bench": "vite-node bench/run.ts"
+  },
+  "dependencies": {
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "uplot": "^1.6.32"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/react": "~19.2.2",
+    "@types/react-dom": "~19.2.2",
+    "@vitejs/plugin-react": "^6.0.1",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.0",
+    "vite-node": "^6.0.0",
+    "vitest": "^5.0.4"
+  }
+}

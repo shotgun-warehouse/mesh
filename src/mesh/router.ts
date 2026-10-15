@@ -1,26 +1,24 @@
-import BleBroadcast, {
-  type PeerConnectionEvent,
-  type ReceivedMessage,
-} from "../native";
+import type {
+  PeerConnectionEvent,
+  ReceivedMessage,
+} from "../native/BleBroadcast.types";
 import {
-  FRAGMENT_PUBLISH_DELAY_MS,
   IDENTITY_BEACON_INTERVAL_MS,
   MAX_PENDING_WIRE_PAYLOADS,
   MAX_SEEN_PACKET_IDS,
   RELAY_PUBLISH_DELAY_MS,
 } from "./constants";
-import { FragmentAssembler } from "./fragments";
-import { meshLog } from "./logger";
+import type { MeshLogger } from "./logger";
 import {
   buildIdentityPacket,
-  buildMessageWirePackets,
   buildRelayPacket,
   createPacketId,
+  isSyncPacketType,
   decodeWirePacket,
   encodeWirePacket,
   type MeshSessionPacket,
-  wirePacketByteLength,
 } from "./packets";
+import type { MeshTransport } from "./transport";
 
 export type MeshIdentityEvent = {
   senderId: string;
@@ -29,18 +27,6 @@ export type MeshIdentityEvent = {
   deviceName: string | null;
   rssi: number;
   timestamp: number;
-};
-
-export type MeshChatEvent = {
-  senderId: string;
-  displayName?: string;
-  messageId: string;
-  text: string;
-  recipientId: string | null;
-  timestamp: number;
-  bleDeviceId: string;
-  deviceName: string | null;
-  rssi: number;
 };
 
 export type MeshLinkEvent = {
@@ -58,16 +44,25 @@ export type MeshLinkDisconnectEvent = {
 
 export type MeshRouterCallbacks = {
   onIdentity: (event: MeshIdentityEvent) => void;
-  onChatMessage: (event: MeshChatEvent) => void;
   onLinkConnected?: (event: MeshLinkEvent) => void;
   onLinkDisconnected?: (event: MeshLinkDisconnectEvent) => void;
   onPeerCountChange?: (connectedPeerCount: number) => void;
   onRelay?: (packetId: string, ttl: number) => void;
+  /** A sync packet for this device (or for every neighbour), and the link it arrived on. */
+  onSyncPacket?: (packet: MeshSessionPacket, linkDeviceId: string) => void;
+};
+
+/** The radio and log sink a router runs on; the simulator runs many routers side by side. */
+export type MeshRouterEnvironment = {
+  transport: MeshTransport;
+  logger: MeshLogger;
 };
 
 type PendingWirePublish = {
   wirePayload: string;
   excludeDeviceId: string | null;
+  /** Only the neighbour with this device ID (sync packets for one neighbour). */
+  targetDeviceId: string | null;
   /** False for periodic traffic (identity beacons) that is re-sent anyway and goes stale. */
   retryIfUnsent: boolean;
 };
@@ -105,9 +100,13 @@ function delay(milliseconds: number): Promise<void> {
  * Runs a send without awaiting it. Native rejects in-flight sends when Bluetooth goes away, so a
  * bare `void` would surface as an unhandled promise rejection.
  */
-function runDetached(task: Promise<void>, description: string): void {
+function runDetached(
+  log: MeshLogger,
+  task: Promise<void>,
+  description: string,
+): void {
   task.catch((taskError: unknown) => {
-    meshLog(
+    log(
       "send",
       `${description} failed`,
       {
@@ -119,23 +118,11 @@ function runDetached(task: Promise<void>, description: string): void {
   });
 }
 
-function isFragmentPacketType(
-  packetType: MeshSessionPacket["packetType"],
-): boolean {
-  return (
-    packetType === "fragmentStart" ||
-    packetType === "fragmentContinue" ||
-    packetType === "fragmentEnd"
-  );
-}
-
 export class MeshRouter {
   private readonly seenPacketIds = new Set<string>();
   private readonly seenPacketOrder: string[] = [];
-  private readonly fragmentAssembler = new FragmentAssembler();
   private readonly pendingWirePayloads: PendingWirePublish[] = [];
   private isPublishing = false;
-  private outboundTransferDepth = 0;
   private connectedPeerCount = 0;
   private identityTimer: ReturnType<typeof setInterval> | null = null;
   private messageSubscription: { remove: () => void } | null = null;
@@ -143,12 +130,23 @@ export class MeshRouter {
   private peerDisconnectedSubscription: { remove: () => void } | null = null;
   private started = false;
   private identityPacketId = createPacketId();
+  private readonly transport: MeshTransport;
+  private readonly log: MeshLogger;
 
   constructor(
     private readonly localClientId: string,
     private localDisplayName: string,
     private readonly callbacks: MeshRouterCallbacks,
-  ) {}
+    { transport, logger }: MeshRouterEnvironment,
+  ) {
+    this.transport = transport;
+    this.log = logger;
+  }
+
+  /** This device's ID, the sender of every packet it originates. */
+  get localDeviceId(): string {
+    return this.localClientId;
+  }
 
   /** Renames this device on the mesh and announces the new name right away. */
   setDisplayName(displayName: string): void {
@@ -160,10 +158,10 @@ export class MeshRouter {
     // Peers drop identity packets whose ID they have already seen, so a new name needs a new ID.
     this.identityPacketId = createPacketId();
 
-    meshLog("identity", "Display name changed", { displayName });
+    this.log("identity", "Display name changed", { displayName });
 
     if (this.started) {
-      runDetached(this.publishIdentityBeacon(), "Identity beacon");
+      runDetached(this.log, this.publishIdentityBeacon(), "Identity beacon");
     }
   }
 
@@ -174,44 +172,52 @@ export class MeshRouter {
 
     this.started = true;
 
-    meshLog("router", "Mesh router starting", {
+    this.log("router", "Mesh router starting", {
       localClientId: this.localClientId,
     });
 
-    this.messageSubscription = BleBroadcast.addListener(
+    this.messageSubscription = this.transport.addListener(
       "onMessageReceived",
       (incomingMessage) => {
         this.handleIncoming(incomingMessage);
       },
     );
 
-    this.peerConnectedSubscription = BleBroadcast.addListener(
+    this.peerConnectedSubscription = this.transport.addListener(
       "onPeerConnected",
       (linkEvent) => {
-        runDetached(this.handlePeerLinkConnected(linkEvent), "Link setup");
+        runDetached(
+          this.log,
+          this.handlePeerLinkConnected(linkEvent),
+          "Link setup",
+        );
       },
     );
 
-    this.peerDisconnectedSubscription = BleBroadcast.addListener(
+    this.peerDisconnectedSubscription = this.transport.addListener(
       "onPeerDisconnected",
       (disconnectEvent) => {
         this.callbacks.onLinkDisconnected?.({
           bleDeviceId: disconnectEvent.deviceId,
           deviceId: disconnectEvent.meshId,
         });
-        runDetached(this.refreshConnectedPeerCount(), "Peer count refresh");
+        runDetached(
+          this.log,
+          this.refreshConnectedPeerCount(),
+          "Peer count refresh",
+        );
       },
     );
 
     await this.refreshConnectedPeerCount();
     await this.publishIdentityBeacon();
     this.identityTimer = setInterval(() => {
-      runDetached(this.publishIdentityBeacon(), "Identity beacon");
+      runDetached(this.log, this.publishIdentityBeacon(), "Identity beacon");
     }, IDENTITY_BEACON_INTERVAL_MS);
   }
 
   async stop(): Promise<void> {
-    meshLog("router", "Mesh router stopping");
+    this.log("router", "Mesh router stopping");
     this.started = false;
     if (this.identityTimer) {
       clearInterval(this.identityTimer);
@@ -226,74 +232,10 @@ export class MeshRouter {
     this.pendingWirePayloads.length = 0;
   }
 
-  async sendBroadcast(json: string, messageId: string): Promise<void> {
-    return this.sendChatMessage(null, json, messageId);
-  }
-
-  async sendChatMessage(
-    recipientId: string | null,
-    text: string,
-    messageId: string,
-  ): Promise<void> {
-    const packets = buildMessageWirePackets(
-      this.localClientId,
-      this.localDisplayName,
-      text,
-      recipientId,
-      messageId,
-    );
-
-    meshLog("send", "Publishing chat message", {
-      messageId,
-      recipientId,
-      textChars: text.length,
-      packetCount: packets.length,
-      packetTypes: packets.map((packet) => packet.packetType),
-      wireChars: packets.map((packet) => wirePacketByteLength(packet)),
-      fragmented: packets.some((packet) =>
-        packet.packetType.startsWith("fragment"),
-      ),
-    });
-
-    const isFragmentedTransfer = packets.length > 1;
-    if (isFragmentedTransfer) {
-      this.outboundTransferDepth += 1;
-    }
-
-    try {
-      for (
-        let packetIndex = 0;
-        packetIndex < packets.length;
-        packetIndex += 1
-      ) {
-        const packet = packets[packetIndex]!;
-        this.markSeen(packet.id);
-        await this.publishPacket(packet);
-
-        const isLastPacket = packetIndex === packets.length - 1;
-        if (isFragmentedTransfer && !isLastPacket) {
-          await delay(FRAGMENT_PUBLISH_DELAY_MS);
-        }
-      }
-    } finally {
-      if (isFragmentedTransfer) {
-        this.outboundTransferDepth -= 1;
-        runDetached(this.flushPendingWirePayloads(), "Queue flush");
-      }
-    }
-  }
-
-  private shouldAllowOutboundBackgroundTraffic(): boolean {
-    return (
-      this.outboundTransferDepth === 0 &&
-      !this.fragmentAssembler.hasActiveTransfers()
-    );
-  }
-
   private async handlePeerLinkConnected(
     linkEvent: PeerConnectionEvent,
   ): Promise<void> {
-    meshLog("link", "Peer link connected", {
+    this.log("link", "Peer link connected", {
       bleDeviceId: linkEvent.deviceId,
       deviceId: linkEvent.meshId,
       deviceName: linkEvent.deviceName,
@@ -314,10 +256,7 @@ export class MeshRouter {
 
   private async publishIdentityBeacon(): Promise<void> {
     // Beacons are periodic and re-sent on every new link, so nobody to talk to means nothing to do.
-    if (
-      this.connectedPeerCount === 0 ||
-      !this.shouldAllowOutboundBackgroundTraffic()
-    ) {
+    if (this.connectedPeerCount === 0) {
       return;
     }
     const packet = buildIdentityPacket(
@@ -332,7 +271,7 @@ export class MeshRouter {
   private handleIncoming(incomingMessage: ReceivedMessage): void {
     const packet = decodeWirePacket(incomingMessage.jsonMessage);
     if (!packet) {
-      meshLog(
+      this.log(
         "receive",
         "Dropped payload — failed to decode wire packet",
         {
@@ -345,7 +284,7 @@ export class MeshRouter {
     }
 
     if (this.hasSeen(packet.id)) {
-      meshLog("dedup", "Skipped already-seen packet", {
+      this.log("dedup", "Skipped already-seen packet", {
         packetId: packet.id,
         packetType: packet.packetType,
         senderId: packet.senderId,
@@ -355,7 +294,7 @@ export class MeshRouter {
 
     this.markSeen(packet.id);
 
-    meshLog("receive", "Accepted incoming packet", {
+    this.log("receive", "Accepted incoming packet", {
       packetId: packet.id,
       packetType: packet.packetType,
       senderId: packet.senderId,
@@ -366,6 +305,10 @@ export class MeshRouter {
 
     if (packet.senderId !== this.localClientId) {
       this.processPacket(packet, incomingMessage);
+      // Link-local sync packets (TTL 0) are never relayed.
+      if (isSyncPacketType(packet.packetType) && packet.ttl <= 0) {
+        return;
+      }
       const linkDeviceId =
         incomingMessage.viaDeviceId ?? incomingMessage.deviceId;
       this.scheduleRelay(packet, linkDeviceId);
@@ -376,8 +319,21 @@ export class MeshRouter {
     packet: MeshSessionPacket,
     incomingMessage: ReceivedMessage,
   ): void {
+    if (isSyncPacketType(packet.packetType)) {
+      const forAnotherDevice =
+        packet.recipientId !== null &&
+        packet.recipientId.toLowerCase() !== this.localClientId.toLowerCase();
+      if (!forAnotherDevice) {
+        this.callbacks.onSyncPacket?.(
+          packet,
+          incomingMessage.viaDeviceId ?? incomingMessage.deviceId,
+        );
+      }
+      return;
+    }
+
     if (packet.packetType === "identity") {
-      meshLog("identity", "Received identity beacon", {
+      this.log("identity", "Received identity beacon", {
         senderId: packet.senderId,
         displayName: packet.displayName,
       });
@@ -389,112 +345,23 @@ export class MeshRouter {
         rssi: incomingMessage.rssi,
         timestamp: incomingMessage.timestamp,
       });
-      return;
     }
-
-    if (packet.packetType === "message") {
-      meshLog("message", "Received complete message packet", {
-        messageId: packet.messageId,
-        senderId: packet.senderId,
-        textChars: packet.text?.length ?? 0,
-      });
-      this.deliverChatPacket(packet, incomingMessage);
-      return;
-    }
-
-    const assembledMessage = this.fragmentAssembler.ingest(packet);
-    if (!assembledMessage) {
-      if (!this.fragmentAssembler.hasActiveTransfers()) {
-        runDetached(this.flushPendingWirePayloads(), "Queue flush");
-      }
-      return;
-    }
-
-    runDetached(this.flushPendingWirePayloads(), "Queue flush");
-
-    meshLog("fragment", "Reassembled fragmented message", {
-      messageId: assembledMessage.messageId,
-      senderId: assembledMessage.senderId,
-      textChars: assembledMessage.text.length,
-      transferId: packet.transferId,
-    });
-
-    this.deliverChatPacket(
-      {
-        ...packet,
-        packetType: "message",
-        senderId: assembledMessage.senderId,
-        recipientId: assembledMessage.recipientId,
-        messageId: assembledMessage.messageId,
-        displayName: assembledMessage.displayName,
-        text: assembledMessage.text,
-        ts: assembledMessage.ts,
-      },
-      incomingMessage,
-    );
-  }
-
-  private deliverChatPacket(
-    packet: MeshSessionPacket,
-    incomingMessage: ReceivedMessage,
-  ): void {
-    if (!packet.messageId || !packet.text) {
-      return;
-    }
-
-    if (
-      packet.recipientId &&
-      packet.recipientId.toLowerCase() !== this.localClientId.toLowerCase()
-    ) {
-      meshLog("message", "Skipped message — not addressed to this client", {
-        messageId: packet.messageId,
-        recipientId: packet.recipientId,
-        localClientId: this.localClientId,
-      });
-      return;
-    }
-
-    meshLog("message", "Delivering chat message to UI", {
-      messageId: packet.messageId,
-      senderId: packet.senderId,
-      textChars: packet.text.length,
-    });
-
-    this.callbacks.onChatMessage({
-      senderId: packet.senderId,
-      displayName: packet.displayName,
-      messageId: packet.messageId,
-      text: packet.text,
-      recipientId: packet.recipientId,
-      timestamp: packet.ts,
-      bleDeviceId: incomingMessage.deviceId,
-      deviceName: incomingMessage.deviceName,
-      rssi: incomingMessage.rssi,
-    });
   }
 
   private scheduleRelay(
     packet: MeshSessionPacket,
     excludeDeviceId: string,
   ): void {
-    if (isFragmentPacketType(packet.packetType)) {
-      return;
-    }
-
-    if (!this.shouldAllowOutboundBackgroundTraffic()) {
-      return;
-    }
-
     const relayPacket = buildRelayPacket(packet);
     if (!relayPacket) {
-      meshLog("relay", "Relay skipped — TTL exhausted", {
+      this.log("relay", "Relay skipped — TTL exhausted", {
         packetId: packet.id,
         packetType: packet.packetType,
       });
       return;
     }
 
-    meshLog("relay", "Scheduling relay", {
+    this.log("relay", "Scheduling relay", {
       packetId: relayPacket.id,
       packetType: relayPacket.packetType,
       ttl: relayPacket.ttl,
@@ -502,7 +369,68 @@ export class MeshRouter {
     });
 
     this.callbacks.onRelay?.(relayPacket.id, relayPacket.ttl);
-    runDetached(this.publishPacket(relayPacket, excludeDeviceId), "Relay");
+    runDetached(
+      this.log,
+      this.publishPacket(relayPacket, excludeDeviceId),
+      "Relay",
+    );
+  }
+
+  /**
+   * Sends a sync packet. Above TTL 0 it floods like any packet (queued and retried when no peer
+   * accepted it). At TTL 0 it is written straight to direct neighbours (just `targetDeviceId`
+   * when set) and resolves once the writes finish: link-local repair traffic stays out of the
+   * relay queue and its pacing, and is never retried (the next sync round re-sends what is
+   * still missing).
+   */
+  async sendSyncPacket(
+    packet: MeshSessionPacket,
+    targetDeviceId: string | null,
+  ): Promise<void> {
+    this.markSeen(packet.id);
+    const pendingPublish: PendingWirePublish = {
+      wirePayload: encodeWirePacket(packet),
+      excludeDeviceId: null,
+      targetDeviceId,
+      retryIfUnsent: packet.ttl > 0,
+    };
+    if (packet.ttl > 0) {
+      await this.publishWire(pendingPublish);
+      return;
+    }
+    await this.sendWire(pendingPublish);
+  }
+
+  /**
+   * One write round. A targeted write that reached nobody while links are up goes to every
+   * neighbour instead: the target's link may not carry its device ID (an iOS peer advertising in
+   * the background), and the packet's recipient keeps other neighbours from acting on it.
+   */
+  private async sendWire(
+    pendingPublish: PendingWirePublish,
+  ): Promise<{
+    sentCount: number;
+    readyPeerCount: number;
+    skippedExcluded: number;
+  }> {
+    const { wirePayload, excludeDeviceId, targetDeviceId } = pendingPublish;
+    const result = await this.transport.sendPacketAsync(
+      wirePayload,
+      excludeDeviceId,
+      targetDeviceId,
+    );
+    if (
+      targetDeviceId === null ||
+      result.sentCount > 0 ||
+      result.readyPeerCount === 0
+    ) {
+      return result;
+    }
+    this.log("send", "Target link unknown; writing to every neighbour", {
+      targetDeviceId,
+      readyPeerCount: result.readyPeerCount,
+    });
+    return this.transport.sendPacketAsync(wirePayload, excludeDeviceId, null);
   }
 
   private async publishPacket(
@@ -512,6 +440,7 @@ export class MeshRouter {
     await this.publishWire({
       wirePayload: encodeWirePacket(packet),
       excludeDeviceId,
+      targetDeviceId: null,
       retryIfUnsent: packet.packetType !== "identity",
     });
   }
@@ -529,7 +458,7 @@ export class MeshRouter {
       droppedCount += 1;
     }
 
-    meshLog(
+    this.log(
       "queue",
       `Queued wire payload — ${reason}`,
       {
@@ -553,12 +482,9 @@ export class MeshRouter {
     this.isPublishing = true;
 
     try {
-      const result = await BleBroadcast.sendPacketAsync(
-        wirePayload,
-        excludeDeviceId,
-      );
+      const result = await this.sendWire(pendingPublish);
 
-      meshLog("send", "sendPacketAsync completed", {
+      this.log("send", "sendPacketAsync completed", {
         wireChars: wirePayload.length,
         sentCount: result.sentCount,
         readyPeerCount: result.readyPeerCount,
@@ -575,7 +501,7 @@ export class MeshRouter {
             "warn",
           );
         } else {
-          meshLog("queue", "Dropped unsent non-retryable wire payload", {
+          this.log("queue", "Dropped unsent non-retryable wire payload", {
             wireChars: wirePayload.length,
             excludeDeviceId,
           });
@@ -585,7 +511,7 @@ export class MeshRouter {
         result.skippedExcluded >= result.readyPeerCount &&
         result.readyPeerCount > 0
       ) {
-        meshLog("relay", "Relay complete — all ready links excluded", {
+        this.log("relay", "Relay complete — all ready links excluded", {
           wireChars: wirePayload.length,
           excludeDeviceId,
           readyPeerCount: result.readyPeerCount,
@@ -593,7 +519,7 @@ export class MeshRouter {
       }
     } finally {
       this.isPublishing = false;
-      runDetached(this.flushPendingWirePayloads(), "Queue flush");
+      runDetached(this.log, this.flushPendingWirePayloads(), "Queue flush");
     }
   }
 
@@ -602,12 +528,8 @@ export class MeshRouter {
       return;
     }
 
-    if (!this.shouldAllowOutboundBackgroundTraffic()) {
-      return;
-    }
-
     if (this.connectedPeerCount === 0) {
-      meshLog(
+      this.log(
         "queue",
         "Pending queue not flushed — no connected peers",
         {
@@ -618,7 +540,7 @@ export class MeshRouter {
       return;
     }
 
-    meshLog("queue", "Flushing pending wire payloads", {
+    this.log("queue", "Flushing pending wire payloads", {
       queueDepth: this.pendingWirePayloads.length,
       connectedPeerCount: this.connectedPeerCount,
     });
@@ -632,21 +554,18 @@ export class MeshRouter {
           continue;
         }
 
-        const result = await BleBroadcast.sendPacketAsync(
-          pendingPublish.wirePayload,
-          pendingPublish.excludeDeviceId,
-        );
+        const result = await this.sendWire(pendingPublish);
 
         if (needsRetry(result, this.connectedPeerCount)) {
           if (!pendingPublish.retryIfUnsent) {
-            meshLog("queue", "Dropped unsent non-retryable wire payload", {
+            this.log("queue", "Dropped unsent non-retryable wire payload", {
               wireChars: pendingPublish.wirePayload.length,
               excludeDeviceId: pendingPublish.excludeDeviceId,
             });
             continue;
           }
 
-          meshLog(
+          this.log(
             "queue",
             "Flush paused — send returned sentCount=0",
             {
@@ -665,14 +584,14 @@ export class MeshRouter {
           result.skippedExcluded >= result.readyPeerCount &&
           result.readyPeerCount > 0
         ) {
-          meshLog("relay", "Relay complete — all ready links excluded", {
+          this.log("relay", "Relay complete — all ready links excluded", {
             wireChars: pendingPublish.wirePayload.length,
             excludeDeviceId: pendingPublish.excludeDeviceId,
             readyPeerCount: result.readyPeerCount,
           });
         }
 
-        meshLog("queue", "Flushed queued wire payload", {
+        this.log("queue", "Flushed queued wire payload", {
           wireChars: pendingPublish.wirePayload.length,
           sentCount: result.sentCount,
           excludeDeviceId: pendingPublish.excludeDeviceId,
@@ -688,10 +607,10 @@ export class MeshRouter {
 
   private async refreshConnectedPeerCount(): Promise<void> {
     const previousCount = this.connectedPeerCount;
-    this.connectedPeerCount = await BleBroadcast.getConnectedPeerCountAsync();
+    this.connectedPeerCount = await this.transport.getConnectedPeerCountAsync();
 
     if (previousCount !== this.connectedPeerCount) {
-      meshLog("link", "Connected peer count changed", {
+      this.log("link", "Connected peer count changed", {
         previousCount,
         connectedPeerCount: this.connectedPeerCount,
       });

@@ -1,0 +1,16 @@
+{
+  "name": "burst",
+  "description": "Main gate; three devices each scan 40 tickets at once (a queue at the turnstiles).",
+  "seed": 11,
+  "preset": "main-gate",
+  "params": { "scanRatePerMin": 0 },
+  "actions": [
+    { "at": "30s", "do": "burst", "device": "gate-1", "count": 40 },
+    { "at": "30s", "do": "burst", "device": "gate-7", "count": 40 },
+    { "at": "30s", "do": "burst", "device": "gate-12", "count": 40 }
+  ],
+  "runUntil": "3m",
+  "expect": {
+    "default": { "lostByProtocol": 0, "convergedWithin": "60s" }
+  }
+}

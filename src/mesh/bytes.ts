@@ -97,11 +97,13 @@ export function writeUint16BE(
 }
 
 export function readUint32BE(bytes: Uint8Array, offset: number): number {
+  // `>>> 0` last: bitwise OR yields a signed 32-bit value.
   return (
-    ((bytes[offset]! << 24) >>> 0) |
-    (bytes[offset + 1]! << 16) |
-    (bytes[offset + 2]! << 8) |
-    bytes[offset + 3]!
+    ((bytes[offset]! << 24) |
+      (bytes[offset + 1]! << 16) |
+      (bytes[offset + 2]! << 8) |
+      bytes[offset + 3]!) >>>
+    0
   );
 }
 

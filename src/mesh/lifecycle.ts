@@ -1,18 +1,18 @@
 import { AppState, Platform } from "react-native";
 
 import BleBroadcast, { type BluetoothState } from "../native";
-import { createUuid } from "./ids";
-import {
-  MAX_SEEN_MESSAGE_IDS,
-  MAX_START_ATTEMPTS,
-  START_RETRY_BASE_DELAY_MS,
-} from "./constants";
-import { MeshNotRunningError } from "./errors";
-import { attachNativeMeshLogs, meshLog, setMeshLoggingEnabled } from "./logger";
+import { MAX_START_ATTEMPTS, START_RETRY_BASE_DELAY_MS } from "./constants";
+import { meshLog, setMeshLoggingEnabled } from "./logger";
+import { attachNativeMeshLogs } from "./nativeLogs";
+import { nativeMeshTransport } from "./nativeTransport";
 import { requestMeshPermissions } from "./permissions";
+import { MeshItemSync } from "../sync/itemSync";
+import { nativeItemPersistence } from "../sync/nativePersistence";
+import type { MeshSyncOptions } from "../sync/sync";
+import type { MeshItem, MeshKeyedItem } from "../sync/types";
+import { deviceIdFromKey } from "./ids";
 import {
   MeshRouter,
-  type MeshChatEvent,
   type MeshIdentityEvent,
   type MeshLinkDisconnectEvent,
   type MeshLinkEvent,
@@ -21,7 +21,7 @@ import {
 /**
  * - `starting`: Bluetooth is usable (or the OS is still answering) and the mesh is starting,
  *   including between failed attempts.
- * - `running`: advertising and scanning; `broadcast` works.
+ * - `running`: advertising and scanning; items spread to peers.
  * - `bluetooth_off`: Bluetooth is turned off.
  * - `permission_denied`: the user denied (or a policy restricts) Bluetooth permission.
  * - `unsupported`: this device cannot run the mesh (no Bluetooth LE, or no peripheral mode).
@@ -45,10 +45,18 @@ export type MeshLifecycleOptions = {
   /** The mesh stopped (Bluetooth went away): every peer link is gone. */
   onSessionStopped: () => void;
   onIdentity: (event: MeshIdentityEvent) => void;
-  onChatMessage: (event: MeshChatEvent) => void;
   onLinkConnected: (event: MeshLinkEvent) => void;
   onLinkDisconnected: (event: MeshLinkDisconnectEvent) => void;
   onPeerCountChange: (connectedPeerCount: number) => void;
+  /** Sync knobs, read live. */
+  syncOptions: () => MeshSyncOptions | undefined;
+  /**
+   * The item set to sync, e.g. the current event; items of other scopes are ignored. `null`
+   * turns sync off (the mesh still relays other devices' packets).
+   */
+  syncScope: string | null;
+  /** Items this device did not have, from peers (already saved). */
+  onItems: (items: MeshItem[]) => void;
 };
 
 type RefreshReason = "mount" | "bluetooth" | "foreground" | "retry";
@@ -58,6 +66,8 @@ type RefreshReason = "mount" | "bluetooth" | "foreground" | "retry";
 // next one starts, and start/stop never interleave.
 let nativeOperationQueue: Promise<void> = Promise.resolve();
 let mountedLifecycleCount = 0;
+/** Started, not yet disposed: `clearMeshItems` empties their sets in memory too. */
+const liveLifecycles = new Set<MeshLifecycle>();
 // Android shows the permission dialog once per app launch. After a denial the user grants it in
 // Settings; the foreground refresh picks that up.
 let hasRequestedAndroidPermissions = false;
@@ -102,21 +112,32 @@ export class MeshLifecycle {
   private status: MeshStatus = "starting";
   private error: string | null = null;
   private router: MeshRouter | null = null;
+  /** The replicated item set; outlives sessions (Bluetooth off and on keeps it). */
+  private readonly itemSync: MeshItemSync;
   private displayName: string;
   private failedStartAttempts = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private isDisposed = false;
-  private readonly seenMessageIds = new Set<string>();
   private bluetoothStateSubscription: { remove: () => void } | null = null;
   private appStateSubscription: { remove: () => void } | null = null;
   private nativeLogSubscription: { remove: () => void } | null = null;
 
   constructor(private readonly options: MeshLifecycleOptions) {
     this.displayName = options.displayName;
+    this.itemSync = new MeshItemSync({
+      deviceId: options.deviceId,
+      persistence: nativeItemPersistence,
+      syncOptions: options.syncOptions,
+      onItems: (items) =>
+        this.isDisposed ? undefined : options.onItems(items),
+      log: meshLog,
+    });
+    void this.itemSync.setScope(options.syncScope);
   }
 
   start(): void {
     mountedLifecycleCount += 1;
+    liveLifecycles.add(this);
     if (mountedLifecycleCount > 1) {
       meshLog(
         "lifecycle",
@@ -159,6 +180,7 @@ export class MeshLifecycle {
 
     this.isDisposed = true;
     mountedLifecycleCount -= 1;
+    liveLifecycles.delete(this);
     this.clearRetryTimer();
     this.bluetoothStateSubscription?.remove();
     this.appStateSubscription?.remove();
@@ -181,26 +203,40 @@ export class MeshLifecycle {
     this.router?.setDisplayName(displayName);
   }
 
-  async broadcast(json: string): Promise<void> {
-    const router = this.router;
-    if (this.isDisposed || this.status !== "running" || !router) {
-      throw new MeshNotRunningError(this.status);
-    }
+  /**
+   * Adds an item to the replicated set, persists it and floods it when the mesh is running. Works
+   * in any status: an item published offline spreads through repair once peers are around.
+   */
+  publishItem(data: string): Promise<MeshItem> {
+    return this.itemSync.publish(data, Date.now());
+  }
 
-    const trimmedJson = json.trim();
-    if (!trimmedJson) {
-      return;
-    }
+  /** Switches the synced set (loads it from disk; the old one stays on disk). `null`: no sync. */
+  setSyncScope(scope: string | null): Promise<void> {
+    return this.itemSync.setScope(scope);
+  }
 
-    const messageId = createUuid();
-    this.markMessageSeen(messageId);
-
-    meshLog("send", "Broadcasting mesh payload", {
-      jsonChars: trimmedJson.length,
-      messageId,
+  /** Seeds `scope`'s set with items the app holds elsewhere; see `MeshContextValue.addItems`. */
+  async addItems(scope: string, items: MeshKeyedItem[]): Promise<void> {
+    const meshItems = items.map(({ deviceKey, seq, createdAt, data }) => {
+      if (!deviceKey.trim()) {
+        throw new Error(
+          `addItems got an item (seq ${seq}) with a blank deviceKey`,
+        );
+      }
+      return { author: deviceIdFromKey(deviceKey), seq, createdAt, data };
     });
+    await this.itemSync.addItems(scope, meshItems);
+  }
 
-    await router.sendBroadcast(trimmedJson, messageId);
+  /** Deletes the synced items; see `clearMeshItems`. */
+  clearItems(): Promise<void> {
+    return this.itemSync.clear();
+  }
+
+  /** Compares with neighbours now (repair just turned on). */
+  compareNow(): void {
+    this.itemSync.compareNow();
   }
 
   private enqueue(operation: () => Promise<void>): void {
@@ -246,7 +282,6 @@ export class MeshLifecycle {
     if (bluetoothState !== "poweredOn") {
       this.clearRetryTimer();
       this.failedStartAttempts = 0;
-      // Status first, so a broadcast() during the stop reports why it failed.
       this.setStatus(statusForUnavailableBluetooth(bluetoothState), null);
       await this.stopSession();
       return;
@@ -301,22 +336,25 @@ export class MeshLifecycle {
             this.options.onIdentity(identityEvent);
           }
         },
-        onChatMessage: (chatEvent) => {
-          if (
-            this.isCurrentRouter(router) &&
-            this.markMessageSeen(chatEvent.messageId)
-          ) {
-            this.options.onChatMessage(chatEvent);
-          }
-        },
         onLinkConnected: (linkEvent) => {
           if (this.isCurrentRouter(router)) {
             this.options.onLinkConnected(linkEvent);
+            if (linkEvent.deviceId) {
+              this.itemSync.neighbourUp(linkEvent.deviceId);
+            }
           }
         },
         onLinkDisconnected: (disconnectEvent) => {
           if (this.isCurrentRouter(router)) {
             this.options.onLinkDisconnected(disconnectEvent);
+            if (disconnectEvent.deviceId) {
+              this.itemSync.neighbourDown(disconnectEvent.deviceId);
+            }
+          }
+        },
+        onSyncPacket: (packet, linkDeviceId) => {
+          if (this.isCurrentRouter(router)) {
+            this.itemSync.handlePacket(packet, linkDeviceId);
           }
         },
         onPeerCountChange: (connectedPeerCount) => {
@@ -325,16 +363,19 @@ export class MeshLifecycle {
           }
         },
       },
+      { transport: nativeMeshTransport, logger: meshLog },
     );
     this.router = router;
 
     try {
       // Router first, so it is listening before the first peer can connect.
       await router.start();
+      this.itemSync.attach(router);
       await BleBroadcast.startBroadcastAsync(this.options.deviceId);
       await BleBroadcast.startScanAsync();
     } catch (startError) {
       this.router = null;
+      this.itemSync.detach();
       await this.stopNative(router);
       // A peer may have linked between advertising and the failure.
       if (!this.isDisposed) {
@@ -390,6 +431,7 @@ export class MeshLifecycle {
 
     this.router = null;
     meshLog("session", "Mesh session stopping");
+    this.itemSync.detach();
     await this.stopNative(router);
 
     if (!this.isDisposed) {
@@ -437,21 +479,20 @@ export class MeshLifecycle {
     this.error = error;
     this.options.onStatusChange(status, error);
   }
+}
 
-  /** Returns false when the message was already delivered (or sent by this device). */
-  private markMessageSeen(messageId: string): boolean {
-    if (this.seenMessageIds.has(messageId)) {
-      return false;
-    }
-
-    this.seenMessageIds.add(messageId);
-    if (this.seenMessageIds.size > MAX_SEEN_MESSAGE_IDS) {
-      // Sets iterate in insertion order: drop the oldest.
-      const oldestMessageId = this.seenMessageIds.values().next().value;
-      if (oldestMessageId !== undefined) {
-        this.seenMessageIds.delete(oldestMessageId);
-      }
-    }
-    return true;
+/**
+ * Deletes every synced item this device holds, in every scope, to free its storage (for example
+ * on logout). A mounted `MeshProvider` keeps running on an emptied set, and repair fetches back
+ * what neighbours of its current scope still hold. This device keeps numbering its own items after
+ * the deleted ones, so peers that hold them never mistake a new item for an old one.
+ */
+export async function clearMeshItems(): Promise<void> {
+  if (liveLifecycles.size === 0) {
+    await nativeItemPersistence.clearAll();
+    return;
   }
+  await Promise.all(
+    [...liveLifecycles].map((lifecycle) => lifecycle.clearItems()),
+  );
 }

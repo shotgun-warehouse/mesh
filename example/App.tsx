@@ -1,16 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { Alert, StyleSheet, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
-import {
-  MeshNotRunningError,
-  MeshProvider,
-  useMesh,
-  useMeshMessages,
-} from "@shotgunlive/mesh";
+import { MeshProvider, useMesh, type MeshItem } from "@shotgunlive/mesh";
 
 import { ChatScreen } from "./src/screens/ChatScreen";
 import { HomeScreen } from "./src/screens/HomeScreen";
 import type { ChatMessage, ChatWireMessage } from "./src/types";
+
+/** Every device running the example chats in one set. */
+const CHAT_SYNC_SCOPE = "chat";
 
 function parseChatWireMessage(json: string): ChatWireMessage | null {
   try {
@@ -24,28 +22,33 @@ function parseChatWireMessage(json: string): ChatWireMessage | null {
   return null;
 }
 
-function MeshChatApp() {
-  const { broadcast, peers, getPeer } = useMesh();
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [activePeerId, setActivePeerId] = useState<string | null>(null);
-
-  useMeshMessages((message) => {
-    const wireMessage = parseChatWireMessage(message.json);
+/** Chat messages are synced items: a device that joins later still gets the conversation. */
+function toChatMessages(items: MeshItem[], outgoing: boolean): ChatMessage[] {
+  return items.flatMap((item) => {
+    const wireMessage = parseChatWireMessage(item.data);
     if (!wireMessage) {
-      return;
+      return [];
     }
-
-    setMessages((previousMessages) => [
-      ...previousMessages,
+    return [
       {
-        id: message.id,
+        id: `${item.author}:${item.seq}`,
         text: wireMessage.text,
-        timestamp: message.timestamp,
-        outgoing: false,
-        senderId: message.senderId,
+        timestamp: item.createdAt,
+        outgoing,
+        senderId: item.author,
       },
-    ]);
+    ];
   });
+}
+
+type MeshChatAppProps = {
+  messages: ChatMessage[];
+  onPublished: (item: MeshItem) => void;
+};
+
+function MeshChatApp({ messages, onPublished }: MeshChatAppProps) {
+  const { publishItem, peers, getPeer } = useMesh();
+  const [activePeerId, setActivePeerId] = useState<string | null>(null);
 
   const activePeer = activePeerId ? getPeer(activePeerId) : undefined;
 
@@ -92,30 +95,13 @@ function MeshChatApp() {
 
   const handleSendMessage = async (text: string) => {
     try {
-      await broadcast(
+      const item = await publishItem(
         JSON.stringify({ type: "chat", text } satisfies ChatWireMessage),
       );
+      onPublished(item);
     } catch (sendError) {
-      Alert.alert(
-        "Message not sent",
-        sendError instanceof MeshNotRunningError
-          ? "The mesh isn't running. Check the status on the home screen."
-          : String(sendError),
-      );
-      return;
+      Alert.alert("Message not sent", String(sendError));
     }
-
-    const timestamp = Date.now();
-    setMessages((previousMessages) => [
-      ...previousMessages,
-      {
-        id: `local-${timestamp}`,
-        text,
-        timestamp,
-        outgoing: true,
-        senderId: "local",
-      },
-    ]);
   };
 
   return (
@@ -139,9 +125,26 @@ function MeshChatApp() {
 }
 
 export default function App() {
+  // The mesh saves items, but this demo keeps its message list in memory only: after a restart it
+  // shows what arrives from then on.
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+
+  const appendItems = (items: MeshItem[], outgoing: boolean) => {
+    setMessages((previousMessages) => [
+      ...previousMessages,
+      ...toChatMessages(items, outgoing),
+    ]);
+  };
+
   return (
-    <MeshProvider>
-      <MeshChatApp />
+    <MeshProvider
+      syncScope={CHAT_SYNC_SCOPE}
+      onItemsReceived={(items) => appendItems(items, false)}
+    >
+      <MeshChatApp
+        messages={messages}
+        onPublished={(item) => appendItems([item], true)}
+      />
     </MeshProvider>
   );
 }

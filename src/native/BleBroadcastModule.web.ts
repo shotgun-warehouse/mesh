@@ -54,12 +54,41 @@ class BleBroadcastModule extends NativeModule<{}> {
   sendPacketAsync(
     _jsonMessage: string,
     _excludeDeviceId?: string | null,
+    _targetDeviceId?: string | null,
   ): Promise<SendPacketResult> {
     return Promise.reject(new Error("BleBroadcast is not available on web"));
   }
 
   getConnectedPeerCountAsync(): Promise<number> {
     return Promise.resolve(0);
+  }
+
+  /** In memory only: the web build has no mesh, items live as long as the page. */
+  private readonly itemFiles = new Map<string, string[]>();
+
+  readItemsAsync(fileKey: string): Promise<string[]> {
+    return Promise.resolve([...(this.itemFiles.get(fileKey) ?? [])]);
+  }
+
+  appendItemsAsync(fileKey: string, lines: string[]): Promise<void> {
+    this.itemFiles.set(fileKey, [
+      ...(this.itemFiles.get(fileKey) ?? []),
+      ...lines,
+    ]);
+    return Promise.resolve();
+  }
+
+  listItemFilesAsync(): Promise<string[]> {
+    return Promise.resolve([...this.itemFiles.keys()]);
+  }
+
+  replaceItemsAsync(fileKey: string, lines: string[]): Promise<void> {
+    if (lines.length === 0) {
+      this.itemFiles.delete(fileKey);
+    } else {
+      this.itemFiles.set(fileKey, [...lines]);
+    }
+    return Promise.resolve();
   }
 }
 

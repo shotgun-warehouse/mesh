@@ -1,0 +1,17 @@
+{
+  "name": "perfect-lab",
+  "description": "No loss, no churn. Even here push-once loses the scans made before every link is up.",
+  "seed": 1,
+  "preset": "perfect-lab",
+  "actions": [
+    { "at": "3m", "do": "setParams", "params": { "scanRatePerMin": 0 } }
+  ],
+  "runUntil": "4m",
+  "expect": {
+    "default": {
+      "lostByProtocol": 0,
+      "convergedWithin": "10s",
+      "coverageMin": 1
+    }
+  }
+}

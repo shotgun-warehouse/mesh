@@ -1,0 +1,15 @@
+{
+  "name": "two-halls-partition",
+  "description": "Two halls joined by one corridor device. The corridor phone dies for 3 minutes while both halls keep scanning; the partition heals at 4 minutes and scanning stops.",
+  "seed": 7,
+  "preset": "two-halls",
+  "actions": [
+    { "at": "1m", "do": "killApp", "device": "corridor" },
+    { "at": "4m", "do": "powerOn", "device": "corridor" },
+    { "at": "4m", "do": "setParams", "params": { "scanRatePerMin": 0 } }
+  ],
+  "runUntil": "7m",
+  "expect": {
+    "default": { "lostByProtocol": 0, "convergedWithin": "60s" }
+  }
+}

@@ -12,6 +12,8 @@ private let localNamePrefix = "SM:"
 private let connectionRetryInterval: TimeInterval = 2
 private let maxMeshPeers = 8
 private let meshIdFileName = "expo-mesh-device-id"
+private let itemsDirectoryName = "expo-mesh-items"
+private let itemsFileSuffix = ".jsonl"
 
 private final class BleBroadcastPeripheralDelegate: NSObject, CBPeripheralManagerDelegate {
   weak var module: BleBroadcastModule?
@@ -302,13 +304,99 @@ public class BleBroadcastModule: Module {
       self.isScanning
     }.runOnQueue(.main)
 
-    AsyncFunction("sendPacketAsync") { (jsonMessage: String, excludeDeviceId: String?, promise: Promise) in
-      self.sendPacket(jsonMessage: jsonMessage, excludeDeviceId: excludeDeviceId, promise: promise)
+    AsyncFunction("sendPacketAsync") { (jsonMessage: String, excludeDeviceId: String?, targetDeviceId: String?, promise: Promise) in
+      self.sendPacket(jsonMessage: jsonMessage, excludeDeviceId: excludeDeviceId, targetDeviceId: targetDeviceId, promise: promise)
     }.runOnQueue(.main)
 
     AsyncFunction("getConnectedPeerCountAsync") {
       self.meshPeers.values.filter { $0.isReady }.count
     }.runOnQueue(.main)
+
+    // Synced items: one append-only file of JSON lines per sync scope (`fileKey` is hex from JS).
+    AsyncFunction("readItemsAsync") { (fileKey: String) throws -> [String] in
+      try self.itemsQueue.sync { try self.readItemLines(fileKey: fileKey) }
+    }
+
+    AsyncFunction("appendItemsAsync") { (fileKey: String, lines: [String]) throws in
+      try self.itemsQueue.sync { try self.appendItemLines(fileKey: fileKey, lines: lines) }
+    }
+
+    AsyncFunction("listItemFilesAsync") { () throws -> [String] in
+      try self.itemsQueue.sync { try self.listItemFileKeys() }
+    }
+
+    AsyncFunction("replaceItemsAsync") { (fileKey: String, lines: [String]) throws in
+      try self.itemsQueue.sync { try self.replaceItemLines(fileKey: fileKey, lines: lines) }
+    }
+  }
+
+  /// Serializes item file access: appends from successive JS calls must not interleave.
+  private let itemsQueue = DispatchQueue(label: "expo.modules.blebroadcast.items")
+
+  /// `Application Support/expo-mesh-items/<fileKey>.jsonl`, excluded from backups like the mesh ID.
+  private func itemsFileUrl(fileKey: String) throws -> URL {
+    guard !fileKey.isEmpty, fileKey.allSatisfy({ $0.isHexDigit }) else {
+      throw Exception(name: "ERR_MESH_ITEMS_KEY", description: "Invalid items file key")
+    }
+    return try itemsDirectoryUrl().appendingPathComponent("\(fileKey)\(itemsFileSuffix)")
+  }
+
+  private func itemsDirectoryUrl() throws -> URL {
+    let fileManager = FileManager.default
+    let supportDirectory = try fileManager.url(
+      for: .applicationSupportDirectory,
+      in: .userDomainMask,
+      appropriateFor: nil,
+      create: true
+    )
+    var directory = supportDirectory.appendingPathComponent(itemsDirectoryName, isDirectory: true)
+    if !fileManager.fileExists(atPath: directory.path) {
+      try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+      var resourceValues = URLResourceValues()
+      resourceValues.isExcludedFromBackup = true
+      try? directory.setResourceValues(resourceValues)
+    }
+    return directory
+  }
+
+  private func listItemFileKeys() throws -> [String] {
+    let names = try FileManager.default.contentsOfDirectory(atPath: try itemsDirectoryUrl().path)
+    return names
+      .filter { name in name.hasSuffix(itemsFileSuffix) }
+      .map { name in String(name.dropLast(itemsFileSuffix.count)) }
+  }
+
+  private func readItemLines(fileKey: String) throws -> [String] {
+    let fileUrl = try itemsFileUrl(fileKey: fileKey)
+    guard let contents = try? String(contentsOf: fileUrl, encoding: .utf8) else {
+      return []
+    }
+    return contents.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+  }
+
+  private func appendItemLines(fileKey: String, lines: [String]) throws {
+    if lines.isEmpty {
+      return
+    }
+    let fileUrl = try itemsFileUrl(fileKey: fileKey)
+    let data = Data((lines.joined(separator: "\n") + "\n").utf8)
+    if !FileManager.default.fileExists(atPath: fileUrl.path) {
+      try data.write(to: fileUrl, options: .atomic)
+      return
+    }
+    let handle = try FileHandle(forWritingTo: fileUrl)
+    defer { try? handle.close() }
+    try handle.seekToEnd()
+    try handle.write(contentsOf: data)
+  }
+
+  private func replaceItemLines(fileKey: String, lines: [String]) throws {
+    let fileUrl = try itemsFileUrl(fileKey: fileKey)
+    if !lines.isEmpty {
+      try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: fileUrl, options: .atomic)
+    } else if FileManager.default.fileExists(atPath: fileUrl.path) {
+      try FileManager.default.removeItem(at: fileUrl)
+    }
   }
 
   /// A random ID of `byteCount` bytes as lowercase hex, generated once per install. It lives in
@@ -517,7 +605,9 @@ public class BleBroadcastModule: Module {
     pendingStartPromise = nil
   }
 
-  private func sendPacket(jsonMessage: String, excludeDeviceId: String?, promise: Promise) {
+  /// Writes to every ready link except `excludeDeviceId`, or only to the link whose advertised
+  /// mesh ID is `targetDeviceId` when it is set.
+  private func sendPacket(jsonMessage: String, excludeDeviceId: String?, targetDeviceId: String?, promise: Promise) {
     guard let payload = Data(base64Encoded: jsonMessage) else {
       promise.reject(Exception(name: "ERR_BLE_PAYLOAD", description: "Unable to decode base64 wire payload"))
       return
@@ -545,6 +635,10 @@ public class BleBroadcastModule: Module {
         continue
       }
 
+      if let targetDeviceId, meshPeer.meshId != targetDeviceId.lowercased() {
+        continue
+      }
+
       guard let characteristic = meshPeer.meshCharacteristic else {
         continue
       }
@@ -567,6 +661,7 @@ public class BleBroadcastModule: Module {
         "payloadBytes": payload.count,
         "wireChars": jsonMessage.count,
         "excludeDeviceId": excludeDeviceId ?? "null",
+        "targetDeviceId": targetDeviceId ?? "null",
         "sentCount": sentCount,
         "readyPeerCount": readyPeerCount,
         "skippedExcluded": skippedExcluded

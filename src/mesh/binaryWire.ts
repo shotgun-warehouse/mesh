@@ -12,7 +12,12 @@ import {
   writeUint32BE,
 } from "./bytes";
 import { DEVICE_ID_BYTES, MAX_WIRE_BYTES } from "./constants";
-import type { MeshSessionPacket, SessionPacketType } from "./sessionTypes";
+import type {
+  MeshItemPart,
+  MeshSessionPacket,
+  SessionPacketType,
+  SyncRange,
+} from "./sessionTypes";
 
 export const WIRE_MAGIC = 0x534d; // 'SM'
 export const WIRE_VERSION = 1;
@@ -20,34 +25,40 @@ export const WIRE_VERSION = 1;
 export const WIRE_FLAG_HAS_RECIPIENT = 0x01;
 
 export const WIRE_TYPE_IDENTITY = 1;
-export const WIRE_TYPE_MESSAGE = 2;
-export const WIRE_TYPE_FRAGMENT_START = 3;
-export const WIRE_TYPE_FRAGMENT_CONTINUE = 4;
-export const WIRE_TYPE_FRAGMENT_END = 5;
+export const WIRE_TYPE_SYNC_ITEMS = 2;
+export const WIRE_TYPE_SYNC_DIGEST = 3;
+export const WIRE_TYPE_SYNC_VECTOR = 4;
+export const WIRE_TYPE_SYNC_REQUEST = 5;
+
+/** Scope hash at the start of every sync payload. */
+const SYNC_SCOPE_BYTES = 4;
+/**
+ * Per part in a `syncItems` payload: author + seq (4) + createdAt (6, ms) + part index and count
+ * (1 + 1) + length (2).
+ */
+export const SYNC_PART_OVERHEAD_BYTES = DEVICE_ID_BYTES + 4 + 6 + 2 + 2;
+const SYNC_VECTOR_ENTRY_BYTES = DEVICE_ID_BYTES + 4;
+const SYNC_RANGE_BYTES = DEVICE_ID_BYTES + 8;
 
 // magic (2) + version + type + flags + ttl + timestamp (4) + packet id (16) + sender id
 const HEADER_SIZE = 26 + DEVICE_ID_BYTES;
 const RECIPIENT_SIZE = DEVICE_ID_BYTES;
 const PAYLOAD_LENGTH_SIZE = 2;
 
-const FRAGMENT_CONTINUE_HEADER_SIZE = 18; // transferId + fragmentIndex
-const FRAGMENT_START_HEADER_SIZE = 40; // transferId + messageId + counts + index
-
-const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
 function wireTypeFromPacketType(packetType: SessionPacketType): number {
   switch (packetType) {
     case "identity":
       return WIRE_TYPE_IDENTITY;
-    case "message":
-      return WIRE_TYPE_MESSAGE;
-    case "fragmentStart":
-      return WIRE_TYPE_FRAGMENT_START;
-    case "fragmentContinue":
-      return WIRE_TYPE_FRAGMENT_CONTINUE;
-    case "fragmentEnd":
-      return WIRE_TYPE_FRAGMENT_END;
+    case "syncItems":
+      return WIRE_TYPE_SYNC_ITEMS;
+    case "syncDigest":
+      return WIRE_TYPE_SYNC_DIGEST;
+    case "syncVector":
+      return WIRE_TYPE_SYNC_VECTOR;
+    case "syncRequest":
+      return WIRE_TYPE_SYNC_REQUEST;
   }
 }
 
@@ -55,14 +66,14 @@ function packetTypeFromWireType(wireType: number): SessionPacketType | null {
   switch (wireType) {
     case WIRE_TYPE_IDENTITY:
       return "identity";
-    case WIRE_TYPE_MESSAGE:
-      return "message";
-    case WIRE_TYPE_FRAGMENT_START:
-      return "fragmentStart";
-    case WIRE_TYPE_FRAGMENT_CONTINUE:
-      return "fragmentContinue";
-    case WIRE_TYPE_FRAGMENT_END:
-      return "fragmentEnd";
+    case WIRE_TYPE_SYNC_ITEMS:
+      return "syncItems";
+    case WIRE_TYPE_SYNC_DIGEST:
+      return "syncDigest";
+    case WIRE_TYPE_SYNC_VECTOR:
+      return "syncVector";
+    case WIRE_TYPE_SYNC_REQUEST:
+      return "syncRequest";
     default:
       return null;
   }
@@ -115,6 +126,212 @@ function writeHeader(
   writeUint16BE(bytes, offset, payloadLength);
 }
 
+function requireDeviceIdBytes(deviceId: string): Uint8Array {
+  const bytes = hexToBytes(deviceId, DEVICE_ID_BYTES);
+  if (!bytes) {
+    throw new Error(`Invalid device ID "${deviceId}" in sync packet`);
+  }
+  return bytes;
+}
+
+/** 48-bit unsigned, big-endian: millisecond timestamps until the year 10889. */
+function writeUint48BE(bytes: Uint8Array, offset: number, value: number): void {
+  writeUint16BE(bytes, offset, Math.floor(value / 2 ** 32) & 0xffff);
+  writeUint32BE(bytes, offset + 2, value >>> 0);
+}
+
+function readUint48BE(bytes: Uint8Array, offset: number): number {
+  return (
+    readUint16BE(bytes, offset) * 2 ** 32 + readUint32BE(bytes, offset + 2)
+  );
+}
+
+function buildSyncPayloadBytes(
+  packet: MeshSessionPacket,
+  wireType: number,
+): Uint8Array {
+  const body = buildSyncBodyBytes(packet, wireType);
+  const payload = new Uint8Array(SYNC_SCOPE_BYTES + body.length);
+  writeUint32BE(payload, 0, packet.scope ?? 0);
+  payload.set(body, SYNC_SCOPE_BYTES);
+  return payload;
+}
+
+function buildSyncBodyBytes(
+  packet: MeshSessionPacket,
+  wireType: number,
+): Uint8Array {
+  switch (wireType) {
+    case WIRE_TYPE_SYNC_ITEMS: {
+      const parts = packet.parts ?? [];
+      if (parts.length > 255) {
+        throw new Error("Sync items packet holds at most 255 parts");
+      }
+      const size = parts.reduce(
+        (sum, part) => sum + SYNC_PART_OVERHEAD_BYTES + part.bytes.length,
+        1,
+      );
+      const payload = new Uint8Array(size);
+      payload[0] = parts.length;
+      let offset = 1;
+      for (const part of parts) {
+        payload.set(requireDeviceIdBytes(part.author), offset);
+        offset += DEVICE_ID_BYTES;
+        writeUint32BE(payload, offset, part.seq);
+        writeUint48BE(
+          payload,
+          offset + 4,
+          Math.max(0, Math.floor(part.createdAt)),
+        );
+        payload[offset + 10] = part.partIndex;
+        payload[offset + 11] = part.partCount;
+        writeUint16BE(payload, offset + 12, part.bytes.length);
+        offset += 14;
+        payload.set(part.bytes, offset);
+        offset += part.bytes.length;
+      }
+      return payload;
+    }
+    case WIRE_TYPE_SYNC_DIGEST: {
+      const payload = new Uint8Array(8);
+      writeUint32BE(payload, 0, packet.digest?.xor ?? 0);
+      writeUint32BE(payload, 4, packet.digest?.count ?? 0);
+      return payload;
+    }
+    case WIRE_TYPE_SYNC_VECTOR: {
+      const entries = packet.vector ?? [];
+      const payload = new Uint8Array(
+        1 + entries.length * SYNC_VECTOR_ENTRY_BYTES,
+      );
+      payload[0] = entries.length;
+      entries.forEach(([author, seq], index) => {
+        const offset = 1 + index * SYNC_VECTOR_ENTRY_BYTES;
+        payload.set(requireDeviceIdBytes(author), offset);
+        writeUint32BE(payload, offset + DEVICE_ID_BYTES, seq);
+      });
+      return payload;
+    }
+    case WIRE_TYPE_SYNC_REQUEST: {
+      const ranges = packet.ranges ?? [];
+      const payload = new Uint8Array(1 + ranges.length * SYNC_RANGE_BYTES);
+      payload[0] = ranges.length;
+      ranges.forEach(([author, fromSeq, toSeq], index) => {
+        const offset = 1 + index * SYNC_RANGE_BYTES;
+        payload.set(requireDeviceIdBytes(author), offset);
+        writeUint32BE(payload, offset + DEVICE_ID_BYTES, fromSeq);
+        writeUint32BE(payload, offset + DEVICE_ID_BYTES + 4, toSeq);
+      });
+      return payload;
+    }
+    default:
+      throw new Error(`Unsupported sync packet type ${wireType}`);
+  }
+}
+
+function decodeSyncPayload(
+  base: MeshSessionPacket,
+  wireType: number,
+  payload: Uint8Array,
+): MeshSessionPacket | null {
+  if (payload.length < SYNC_SCOPE_BYTES) {
+    return null;
+  }
+  return decodeSyncBody(
+    { ...base, scope: readUint32BE(payload, 0) },
+    wireType,
+    payload.slice(SYNC_SCOPE_BYTES),
+  );
+}
+
+function decodeSyncBody(
+  base: MeshSessionPacket,
+  wireType: number,
+  payload: Uint8Array,
+): MeshSessionPacket | null {
+  if (payload.length < 1 && wireType !== WIRE_TYPE_SYNC_DIGEST) {
+    return null;
+  }
+  switch (wireType) {
+    case WIRE_TYPE_SYNC_ITEMS: {
+      const parts: MeshItemPart[] = [];
+      let offset = 1;
+      for (let index = 0; index < payload[0]!; index += 1) {
+        if (payload.length < offset + SYNC_PART_OVERHEAD_BYTES) {
+          return null;
+        }
+        const author = bytesToHex(
+          payload.slice(offset, offset + DEVICE_ID_BYTES),
+        );
+        offset += DEVICE_ID_BYTES;
+        const seq = readUint32BE(payload, offset);
+        const createdAt = readUint48BE(payload, offset + 4);
+        const partIndex = payload[offset + 10]!;
+        const partCount = payload[offset + 11]!;
+        const length = readUint16BE(payload, offset + 12);
+        offset += 14;
+        if (payload.length < offset + length || partIndex >= partCount) {
+          return null;
+        }
+        parts.push({
+          author,
+          seq,
+          createdAt,
+          partIndex,
+          partCount,
+          bytes: payload.slice(offset, offset + length),
+        });
+        offset += length;
+      }
+      return { ...base, parts };
+    }
+    case WIRE_TYPE_SYNC_DIGEST: {
+      if (payload.length < 8) {
+        return null;
+      }
+      return {
+        ...base,
+        digest: {
+          xor: readUint32BE(payload, 0),
+          count: readUint32BE(payload, 4),
+        },
+      };
+    }
+    case WIRE_TYPE_SYNC_VECTOR: {
+      const count = payload[0]!;
+      if (payload.length < 1 + count * SYNC_VECTOR_ENTRY_BYTES) {
+        return null;
+      }
+      const vector: [string, number][] = [];
+      for (let index = 0; index < count; index += 1) {
+        const offset = 1 + index * SYNC_VECTOR_ENTRY_BYTES;
+        vector.push([
+          bytesToHex(payload.slice(offset, offset + DEVICE_ID_BYTES)),
+          readUint32BE(payload, offset + DEVICE_ID_BYTES),
+        ]);
+      }
+      return { ...base, vector };
+    }
+    case WIRE_TYPE_SYNC_REQUEST: {
+      const count = payload[0]!;
+      if (payload.length < 1 + count * SYNC_RANGE_BYTES) {
+        return null;
+      }
+      const ranges: SyncRange[] = [];
+      for (let index = 0; index < count; index += 1) {
+        const offset = 1 + index * SYNC_RANGE_BYTES;
+        ranges.push([
+          bytesToHex(payload.slice(offset, offset + DEVICE_ID_BYTES)),
+          readUint32BE(payload, offset + DEVICE_ID_BYTES),
+          readUint32BE(payload, offset + DEVICE_ID_BYTES + 4),
+        ]);
+      }
+      return { ...base, ranges };
+    }
+    default:
+      return null;
+  }
+}
+
 function buildPayloadBytes(
   packet: MeshSessionPacket,
   wireType: number,
@@ -127,70 +344,11 @@ function buildPayloadBytes(
       payload.set(nameBytes, 1);
       return payload;
     }
-    case WIRE_TYPE_MESSAGE: {
-      if (!packet.messageId) {
-        throw new Error("Message packet missing messageId");
-      }
-      const messageIdBytes = uuidStringToBytes(packet.messageId);
-      if (!messageIdBytes) {
-        throw new Error("Invalid messageId UUID");
-      }
-      const textBytes = textEncoder.encode(packet.text ?? "");
-      const payload = new Uint8Array(16 + 2 + textBytes.length);
-      payload.set(messageIdBytes, 0);
-      writeUint16BE(payload, 16, textBytes.length);
-      payload.set(textBytes, 18);
-      return payload;
-    }
-    case WIRE_TYPE_FRAGMENT_START:
-    case WIRE_TYPE_FRAGMENT_CONTINUE:
-    case WIRE_TYPE_FRAGMENT_END: {
-      if (
-        !packet.transferId ||
-        packet.fragmentIndex === undefined ||
-        !packet.chunkBytes
-      ) {
-        throw new Error("Fragment packet missing required fields");
-      }
-
-      const transferBytes = uuidStringToBytes(packet.transferId);
-      if (!transferBytes) {
-        throw new Error("Invalid transferId UUID");
-      }
-
-      if (
-        wireType === WIRE_TYPE_FRAGMENT_CONTINUE ||
-        wireType === WIRE_TYPE_FRAGMENT_END
-      ) {
-        const payload = new Uint8Array(
-          FRAGMENT_CONTINUE_HEADER_SIZE + packet.chunkBytes.length,
-        );
-        payload.set(transferBytes, 0);
-        writeUint16BE(payload, 16, packet.fragmentIndex);
-        payload.set(packet.chunkBytes, 18);
-        return payload;
-      }
-
-      if (!packet.messageId || !packet.fragmentCount || !packet.totalBytes) {
-        throw new Error("Fragment start packet missing required fields");
-      }
-
-      const messageIdBytes = uuidStringToBytes(packet.messageId);
-      if (!messageIdBytes) {
-        throw new Error("Invalid messageId UUID");
-      }
-
-      const payload = new Uint8Array(
-        FRAGMENT_START_HEADER_SIZE + packet.chunkBytes.length,
-      );
-      payload.set(transferBytes, 0);
-      payload.set(messageIdBytes, 16);
-      writeUint16BE(payload, 32, packet.fragmentCount);
-      writeUint32BE(payload, 34, packet.totalBytes);
-      writeUint16BE(payload, 38, packet.fragmentIndex);
-      payload.set(packet.chunkBytes, 40);
-      return payload;
-    }
+    case WIRE_TYPE_SYNC_ITEMS:
+    case WIRE_TYPE_SYNC_DIGEST:
+    case WIRE_TYPE_SYNC_VECTOR:
+    case WIRE_TYPE_SYNC_REQUEST:
+      return buildSyncPayloadBytes(packet, wireType);
     default:
       throw new Error(`Unsupported wire packet type ${wireType}`);
   }
@@ -295,53 +453,11 @@ export function decodeBinaryWirePacket(
       const displayName = textDecoder.decode(payload.slice(1, 1 + nameLength));
       return { ...base, displayName };
     }
-    case WIRE_TYPE_MESSAGE: {
-      if (payload.length < 18) {
-        return null;
-      }
-      const messageId = uuidBytesToString(payload.slice(0, 16));
-      const textLength = readUint16BE(payload, 16);
-      const text = textDecoder.decode(payload.slice(18, 18 + textLength));
-      return { ...base, messageId, text };
-    }
-    case WIRE_TYPE_FRAGMENT_START:
-    case WIRE_TYPE_FRAGMENT_CONTINUE:
-    case WIRE_TYPE_FRAGMENT_END: {
-      if (wireType === WIRE_TYPE_FRAGMENT_START) {
-        if (payload.length < FRAGMENT_START_HEADER_SIZE) {
-          return null;
-        }
-        const transferId = uuidBytesToString(payload.slice(0, 16));
-        const messageId = uuidBytesToString(payload.slice(16, 32));
-        const fragmentCount = readUint16BE(payload, 32);
-        const totalBytes = readUint32BE(payload, 34);
-        const fragmentIndex = readUint16BE(payload, 38);
-        const chunkBytes = payload.slice(40);
-        return {
-          ...base,
-          transferId,
-          messageId,
-          fragmentIndex,
-          fragmentCount,
-          totalBytes,
-          chunkBytes,
-        };
-      }
-
-      if (payload.length < FRAGMENT_CONTINUE_HEADER_SIZE) {
-        return null;
-      }
-
-      const transferId = uuidBytesToString(payload.slice(0, 16));
-      const fragmentIndex = readUint16BE(payload, 16);
-      const chunkBytes = payload.slice(18);
-      return {
-        ...base,
-        transferId,
-        fragmentIndex,
-        chunkBytes,
-      };
-    }
+    case WIRE_TYPE_SYNC_ITEMS:
+    case WIRE_TYPE_SYNC_DIGEST:
+    case WIRE_TYPE_SYNC_VECTOR:
+    case WIRE_TYPE_SYNC_REQUEST:
+      return decodeSyncPayload(base, wireType, payload);
     default:
       return null;
   }

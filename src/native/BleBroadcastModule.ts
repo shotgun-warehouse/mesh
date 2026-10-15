@@ -28,11 +28,24 @@ declare class BleBroadcastModule extends NativeModule<BleBroadcastModuleEvents> 
   startScanAsync(): Promise<void>;
   stopScanAsync(): Promise<void>;
   isScanningAsync(): Promise<boolean>;
+  /**
+   * Writes a wire packet to every ready link except `excludeDeviceId`, or only to the link whose
+   * advertised mesh ID is `targetDeviceId` when set (none when no link carries it).
+   */
   sendPacketAsync(
     jsonMessage: string,
     excludeDeviceId?: string | null,
+    targetDeviceId?: string | null,
   ): Promise<SendPacketResult>;
   getConnectedPeerCountAsync(): Promise<number>;
+  /** Lines of the synced-items file `fileKey` (lowercase hex); empty when it does not exist. */
+  readItemsAsync(fileKey: string): Promise<string[]>;
+  /** Appends lines (no newlines inside) to the synced-items file `fileKey`. */
+  appendItemsAsync(fileKey: string, lines: string[]): Promise<void>;
+  /** Keys of the synced-items files that exist. */
+  listItemFilesAsync(): Promise<string[]>;
+  /** Atomically replaces the synced-items file `fileKey` with `lines`; deletes it when empty. */
+  replaceItemsAsync(fileKey: string, lines: string[]): Promise<void>;
 }
 
 export default requireNativeModule<BleBroadcastModule>("BleBroadcast");

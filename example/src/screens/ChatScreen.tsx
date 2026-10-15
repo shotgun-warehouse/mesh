@@ -9,7 +9,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import type { MeshPeer } from "@shotgunlive/mesh";
+import type { MeshPeer } from "../types";
 
 import type { ChatMessage } from "../types";
 
@@ -132,7 +132,8 @@ export function ChatScreen({
           <View style={styles.emptyState}>
             <Text style={styles.emptyTitle}>No messages yet</Text>
             <Text style={styles.emptyBody}>
-              Say hello. Messages are broadcast over BLE to nearby devices.
+              Say hello. Messages sync over BLE to every device nearby, even
+              ones that join later.
             </Text>
           </View>
         }

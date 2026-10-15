@@ -1,6 +1,6 @@
 {
   "name": "@shotgunlive/mesh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "BLE mesh networking SDK for Expo apps",
   "license": "MIT",
   "author": "Shotgun",
@@ -46,7 +46,10 @@
     "build": "tsc -p tsconfig.build.json && tsc -p plugin/tsconfig.json",
     "clean": "rm -rf build plugin/build",
     "typecheck": "tsc --noEmit && tsc -p plugin/tsconfig.json --noEmit",
-    "prepare": "pnpm run clean && pnpm run build"
+    "prepare": "pnpm run clean && pnpm run build",
+    "sim": "pnpm --filter mesh-simulator dev",
+    "sim:test": "pnpm --filter mesh-simulator test",
+    "sim:bench": "pnpm --filter mesh-simulator bench"
   },
   "publishConfig": {
     "access": "public",

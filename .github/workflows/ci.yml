@@ -19,5 +19,9 @@ jobs:
       - run: pnpm typecheck
       - name: Typecheck example
         run: pnpm --filter shotgun-mesh-chat-example exec tsc --noEmit
+      - name: Simulator typecheck and tests
+        run: pnpm --filter mesh-simulator typecheck && pnpm sim:test
+      - name: Simulator bench (scenario expectations)
+        run: pnpm sim:bench
       - name: Check package contents
         run: pnpm pack --dry-run

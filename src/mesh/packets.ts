@@ -1,20 +1,19 @@
 import {
-    binaryWireByteLength,
-    decodeBinaryWireBase64,
-    encodeBinaryWireBase64,
-    isBinaryWireBase64,
+  binaryWireByteLength,
+  decodeBinaryWireBase64,
+  encodeBinaryWireBase64,
+  isBinaryWireBase64,
 } from "./binaryWire";
 import { createUuid } from "./ids";
-import {
-    DEFAULT_TTL,
-    IDENTITY_TTL,
-    INITIAL_FRAGMENT_CHUNK_BYTES,
-    MAX_WIRE_BYTES,
-    MAX_WIRE_FIT_BYTES,
-} from "./constants";
-import type { MeshSessionPacket, SessionPacketType } from "./sessionTypes";
+import { IDENTITY_TTL, MAX_WIRE_BYTES } from "./constants";
+import type {
+  MeshItemPart,
+  MeshSessionPacket,
+  SessionPacketType,
+  SyncRange,
+} from "./sessionTypes";
 
-export type { MeshSessionPacket, SessionPacketType };
+export type { MeshItemPart, MeshSessionPacket, SessionPacketType, SyncRange };
 
 export function createPacketId(): string {
   return createUuid();
@@ -45,14 +44,6 @@ function safeWirePacketByteLength(packet: MeshSessionPacket): number {
   }
 }
 
-function fitsOnWire(packet: MeshSessionPacket): boolean {
-  return safeWirePacketByteLength(packet) <= MAX_WIRE_FIT_BYTES;
-}
-
-function exceedsWireLimit(packet: MeshSessionPacket): boolean {
-  return safeWirePacketByteLength(packet) > MAX_WIRE_BYTES;
-}
-
 export function buildIdentityPacket(
   senderId: string,
   displayName: string,
@@ -70,209 +61,47 @@ export function buildIdentityPacket(
   };
 }
 
-export function buildMessagePacket(
+export function isSyncPacketType(packetType: SessionPacketType): boolean {
+  return (
+    packetType === "syncItems" ||
+    packetType === "syncDigest" ||
+    packetType === "syncVector" ||
+    packetType === "syncRequest"
+  );
+}
+
+/**
+ * A sync packet. `ttl` 0 keeps it on direct links (never relayed); `recipientId` addresses it to
+ * one neighbour (others ignore it).
+ */
+export function buildSyncPacket(
   senderId: string,
-  displayName: string,
-  text: string,
+  packetType: "syncItems" | "syncDigest" | "syncVector" | "syncRequest",
+  scope: number,
+  body: {
+    parts?: MeshItemPart[];
+    digest?: { xor: number; count: number };
+    vector?: [string, number][];
+    ranges?: SyncRange[];
+  },
+  ttl: number,
   recipientId: string | null,
-  messageId: string = createPacketId(),
-  ttl: number = DEFAULT_TTL,
-  packetId: string = createPacketId(),
 ): MeshSessionPacket {
   return {
     type: "mesh.session",
-    packetType: "message",
-    id: packetId,
+    packetType,
+    id: createPacketId(),
     senderId,
     recipientId,
     ttl,
     ts: Date.now(),
-    displayName,
-    messageId,
-    text,
+    scope,
+    ...body,
   };
 }
 
-function buildFragmentPacketType(
-  fragmentIndex: number,
-  fragmentCount: number,
-): SessionPacketType {
-  if (fragmentIndex === 0) {
-    return "fragmentStart";
-  }
-
-  if (fragmentIndex === fragmentCount - 1) {
-    return "fragmentEnd";
-  }
-
-  return "fragmentContinue";
-}
-
-function splitBytes(payload: Uint8Array, chunkSize: number): Uint8Array[] {
-  const chunks: Uint8Array[] = [];
-  for (let offset = 0; offset < payload.length; offset += chunkSize) {
-    chunks.push(payload.slice(offset, offset + chunkSize));
-  }
-  return chunks;
-}
-
-function buildFragmentPacket(
-  byteChunk: Uint8Array,
-  fragmentIndex: number,
-  fragmentCount: number,
-  senderId: string,
-  recipientId: string | null,
-  messageId: string,
-  transferId: string,
-  totalBytes: number,
-  packetId: string,
-): MeshSessionPacket {
-  return {
-    type: "mesh.session",
-    packetType: buildFragmentPacketType(fragmentIndex, fragmentCount),
-    id: packetId,
-    senderId,
-    recipientId,
-    ttl: DEFAULT_TTL,
-    ts: Date.now(),
-    messageId,
-    transferId,
-    fragmentIndex,
-    fragmentCount,
-    totalBytes,
-    chunkBytes: byteChunk,
-  };
-}
-
-function buildFragmentCandidatePackets(
-  textBytes: Uint8Array,
-  chunkSize: number,
-  senderId: string,
-  recipientId: string | null,
-  messageId: string,
-  transferId: string,
-  packetIds: string[],
-): MeshSessionPacket[] {
-  const byteChunks = splitBytes(textBytes, chunkSize);
-
-  return byteChunks.map((byteChunk, fragmentIndex) =>
-    buildFragmentPacket(
-      byteChunk,
-      fragmentIndex,
-      byteChunks.length,
-      senderId,
-      recipientId,
-      messageId,
-      transferId,
-      textBytes.length,
-      packetIds[fragmentIndex]!,
-    ),
-  );
-}
-
-function findLargestFittingChunkSize(
-  textBytes: Uint8Array,
-  senderId: string,
-  recipientId: string | null,
-  messageId: string,
-  transferId: string,
-  packetIds: string[],
-): number | null {
-  let low = 1;
-  let high = Math.min(INITIAL_FRAGMENT_CHUNK_BYTES, textBytes.length);
-  let bestChunkSize: number | null = null;
-
-  while (low <= high) {
-    const chunkSize = Math.floor((low + high) / 2);
-    const candidatePackets = buildFragmentCandidatePackets(
-      textBytes,
-      chunkSize,
-      senderId,
-      recipientId,
-      messageId,
-      transferId,
-      packetIds,
-    );
-
-    if (candidatePackets.every(fitsOnWire)) {
-      bestChunkSize = chunkSize;
-      low = chunkSize + 1;
-    } else {
-      high = chunkSize - 1;
-    }
-  }
-
-  return bestChunkSize;
-}
-
-export function buildMessageWirePackets(
-  senderId: string,
-  displayName: string,
-  text: string,
-  recipientId: string | null,
-  messageId: string = createPacketId(),
-): MeshSessionPacket[] {
-  const singlePacket = buildMessagePacket(
-    senderId,
-    displayName,
-    text,
-    recipientId,
-    messageId,
-  );
-
-  if (fitsOnWire(singlePacket)) {
-    return [singlePacket];
-  }
-
-  const textBytes = new TextEncoder().encode(text);
-  const transferId = createPacketId();
-  const packetIds = Array.from({ length: textBytes.length }, () =>
-    createPacketId(),
-  );
-  let chunkSize = findLargestFittingChunkSize(
-    textBytes,
-    senderId,
-    recipientId,
-    messageId,
-    transferId,
-    packetIds,
-  );
-
-  if (chunkSize === null) {
-    throw new Error(
-      `Unable to fragment message into packets that fit the ${MAX_WIRE_BYTES}-byte wire limit.`,
-    );
-  }
-
-  let packets = buildFragmentCandidatePackets(
-    textBytes,
-    chunkSize,
-    senderId,
-    recipientId,
-    messageId,
-    transferId,
-    packetIds,
-  );
-
-  while (packets.some(exceedsWireLimit)) {
-    chunkSize -= 1;
-    if (chunkSize < 1) {
-      throw new Error(
-        `Unable to fragment message into packets that fit the ${MAX_WIRE_BYTES}-byte wire limit.`,
-      );
-    }
-    packets = buildFragmentCandidatePackets(
-      textBytes,
-      chunkSize,
-      senderId,
-      recipientId,
-      messageId,
-      transferId,
-      packetIds,
-    );
-  }
-
-  return packets;
+export function fitsOneWrite(packet: MeshSessionPacket): boolean {
+  return safeWirePacketByteLength(packet) <= MAX_WIRE_BYTES;
 }
 
 export function buildRelayPacket(
@@ -287,4 +116,3 @@ export function buildRelayPacket(
     ttl: packet.ttl - 1,
   };
 }
-

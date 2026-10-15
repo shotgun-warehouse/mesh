@@ -1,3 +1,5 @@
+import type { useMesh } from "@shotgunlive/mesh";
+
 export type ChatMessage = {
   id: string;
   text: string;
@@ -10,3 +12,7 @@ export type ChatWireMessage = {
   type: "chat";
   text: string;
 };
+
+type MeshState = ReturnType<typeof useMesh>;
+export type MeshPeer = MeshState["peers"][number];
+export type MeshStatus = MeshState["status"];

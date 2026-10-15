@@ -1,7 +1,5 @@
 import { Platform } from "react-native";
 
-import BleBroadcast, { type MeshLogEvent } from "../native";
-
 export type MeshLogLevel = "debug" | "info" | "warn" | "error";
 
 let meshLoggingEnabled = false;
@@ -22,7 +20,7 @@ function getPlatformLabel(): string {
   return Platform.OS;
 }
 
-function formatMeshLogLine(
+export function formatMeshLogLine(
   platform: string,
   layer: "js" | "native",
   tag: string,
@@ -33,7 +31,7 @@ function formatMeshLogLine(
   return `[ShotgunMesh][${platform}][${layer}][${tag}] ${message}${detailSuffix}`;
 }
 
-function shouldEmitMeshLog(level: MeshLogLevel): boolean {
+export function isMeshLogEmitted(level: MeshLogLevel): boolean {
   if (meshLoggingEnabled) {
     return true;
   }
@@ -41,13 +39,21 @@ function shouldEmitMeshLog(level: MeshLogLevel): boolean {
   return level === "warn" || level === "error";
 }
 
+/** Where the router and item sync write their logs. */
+export type MeshLogger = (
+  tag: string,
+  message: string,
+  detail?: Record<string, unknown>,
+  level?: MeshLogLevel,
+) => void;
+
 export function meshLog(
   tag: string,
   message: string,
   detail?: Record<string, unknown>,
   level: MeshLogLevel = "info",
 ): void {
-  if (!shouldEmitMeshLog(level)) {
+  if (!isMeshLogEmitted(level)) {
     return;
   }
 
@@ -70,41 +76,4 @@ export function meshLog(
   }
 
   console.log(line);
-}
-
-export function attachNativeMeshLogs(): { remove: () => void } {
-  return BleBroadcast.addListener("onMeshLog", (event: MeshLogEvent) => {
-    if (!shouldEmitMeshLog(event.level)) {
-      return;
-    }
-
-    let detail: Record<string, unknown> | undefined;
-    if (event.detail) {
-      try {
-        detail = JSON.parse(event.detail) as Record<string, unknown>;
-      } catch {
-        detail = { rawDetail: event.detail };
-      }
-    }
-
-    const line = formatMeshLogLine(
-      event.platform,
-      "native",
-      event.tag,
-      event.message,
-      detail,
-    );
-
-    if (event.level === "error") {
-      console.error(line);
-      return;
-    }
-
-    if (event.level === "warn") {
-      console.warn(line);
-      return;
-    }
-
-    console.log(line);
-  });
 }

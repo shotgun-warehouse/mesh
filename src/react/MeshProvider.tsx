@@ -10,17 +10,11 @@ import { Platform } from "react-native";
 
 import BleBroadcast from "../native";
 import { DEVICE_ID_BYTES } from "../mesh/constants";
-import { MeshNotRunningError } from "../mesh/errors";
-import { createDeviceId, isDeviceId } from "../mesh/ids";
+import { createDeviceId, deviceIdFromKey, isDeviceId } from "../mesh/ids";
 import { MeshLifecycle } from "../mesh/lifecycle";
-import { meshLog } from "../mesh/logger";
+import { resolveSyncOptions, type MeshSyncOptions } from "../sync/sync";
 
-import {
-  MeshContext,
-  MeshMessagesContext,
-  type MeshContextValue,
-  type MeshMessageSubscribe,
-} from "./MeshContext";
+import { MeshContext, type MeshContextValue } from "./MeshContext";
 import {
   removePeer,
   toMeshPeer,
@@ -28,11 +22,7 @@ import {
   type MeshPeerRecord,
   type MeshPeerUpdate,
 } from "./peerUtils";
-import type {
-  MeshInboundMessage,
-  MeshMessageListener,
-  MeshStatus,
-} from "./types";
+import type { MeshItemsListener, MeshStatus } from "./types";
 
 export type MeshProviderProps = {
   children: ReactNode;
@@ -43,6 +33,33 @@ export type MeshProviderProps = {
   displayName?: string;
   /** Verbose JS and native mesh logs. Defaults to `__DEV__`. Read once, on mount. */
   debug?: boolean;
+  /**
+   * Which synced item set this device works on (for example the current event ID): items are
+   * saved per scope and devices only sync items of the same scope. Changing it switches sets.
+   * `null` turns sync off: no set is loaded, nothing is published or received, and the mesh still
+   * relays other devices' packets.
+   */
+  syncScope: string | null;
+  /**
+   * The app's own ID for this install (for example the ID its server knows the device by). When
+   * set, the mesh device ID is derived from it (a hash), so every item this device publishes is
+   * authored by that ID and `addItems` can match server copies to mesh items. Keep it stable per
+   * install; changing it restarts the mesh under the new ID. Must not be blank. Without it, the
+   * device ID is random, generated once per install.
+   */
+  deviceKey?: string;
+  /**
+   * Called with items published on other devices, the first time each reaches this one. The
+   * library has already deduplicated and saved them; do what you like with them. Each item comes
+   * once, across restarts too (only an item that arrives as the app is killed, before its save
+   * lands, can come again).
+   */
+  onItemsReceived?: MeshItemsListener;
+  /**
+   * Knobs for item sync (`publishItem` / `onItemsReceived`). Read live: a change applies within a
+   * sync round, with no restart. Omitted fields keep their defaults (`DEFAULT_SYNC_OPTIONS`).
+   */
+  sync?: MeshSyncOptions;
 };
 
 function normalizeDisplayName(displayName: string | undefined): string | null {
@@ -63,6 +80,16 @@ function getLocalDeviceId(): string {
   return createDeviceId();
 }
 
+function resolveDeviceId(deviceKey: string | undefined): string {
+  if (deviceKey === undefined) {
+    return getLocalDeviceId();
+  }
+  if (!deviceKey.trim()) {
+    throw new Error("MeshProvider deviceKey must not be blank");
+  }
+  return deviceIdFromKey(deviceKey);
+}
+
 function getDefaultDisplayName(): string {
   return (
     normalizeDisplayName(BleBroadcast.deviceName ?? undefined) ??
@@ -79,8 +106,12 @@ export function MeshProvider({
   children,
   displayName: displayNameProp,
   debug = __DEV__,
+  syncScope,
+  deviceKey,
+  onItemsReceived,
+  sync,
 }: MeshProviderProps) {
-  const [deviceId] = useState(getLocalDeviceId);
+  const deviceId = useMemo(() => resolveDeviceId(deviceKey), [deviceKey]);
   const [displayName, setDisplayNameState] = useState(
     () => normalizeDisplayName(displayNameProp) ?? getDefaultDisplayName(),
   );
@@ -92,7 +123,11 @@ export function MeshProvider({
   const lifecycleRef = useRef<MeshLifecycle | null>(null);
   const displayNameRef = useRef(displayName);
   const debugRef = useRef(debug);
-  const messageListenersRef = useRef(new Set<MeshMessageListener>());
+  const onItemsReceivedRef = useRef(onItemsReceived);
+  onItemsReceivedRef.current = onItemsReceived;
+  const syncOptionsRef = useRef(sync);
+  syncOptionsRef.current = sync;
+  const syncScopeRef = useRef(syncScope);
   const previousDisplayNamePropRef = useRef(displayNameProp);
 
   useEffect(() => {
@@ -149,34 +184,9 @@ export function MeshProvider({
         }
       },
       onPeerCountChange: setConnectedPeerCount,
-      onChatMessage: (chatEvent) => {
-        updatePeer({ id: chatEvent.senderId, lastSeen: chatEvent.timestamp });
-
-        const message: MeshInboundMessage = {
-          id: chatEvent.messageId,
-          json: chatEvent.text,
-          senderId: chatEvent.senderId,
-          timestamp: chatEvent.timestamp,
-        };
-
-        for (const listener of messageListenersRef.current) {
-          try {
-            listener(message);
-          } catch (listenerError) {
-            meshLog(
-              "message",
-              "A useMeshMessages listener threw",
-              {
-                message:
-                  listenerError instanceof Error
-                    ? listenerError.message
-                    : String(listenerError),
-              },
-              "error",
-            );
-          }
-        }
-      },
+      syncOptions: () => syncOptionsRef.current,
+      syncScope: syncScopeRef.current,
+      onItems: (items) => onItemsReceivedRef.current?.(items),
     });
 
     lifecycleRef.current = lifecycle;
@@ -213,13 +223,43 @@ export function MeshProvider({
     }
   }, [displayNameProp, setDisplayName]);
 
-  const broadcast = useCallback(async (json: string) => {
+  useEffect(() => {
+    syncScopeRef.current = syncScope;
+    void lifecycleRef.current?.setSyncScope(syncScope);
+  }, [syncScope]);
+
+  const publishItem = useCallback(async (data: string) => {
     const lifecycle = lifecycleRef.current;
     if (!lifecycle) {
-      throw new MeshNotRunningError("starting");
+      throw new Error(
+        "publishItem was called after the MeshProvider unmounted",
+      );
     }
-    await lifecycle.broadcast(json);
+    return lifecycle.publishItem(data);
   }, []);
+
+  const addItems = useCallback<MeshContextValue["addItems"]>(
+    async (scope, items) => {
+      const lifecycle = lifecycleRef.current;
+      if (!lifecycle) {
+        throw new Error("addItems was called after the MeshProvider unmounted");
+      }
+      return lifecycle.addItems(scope, items);
+    },
+    [],
+  );
+
+  // Repair turning on (the app caught up with its server): compare with neighbours now rather
+  // than at the next beacons, which can be 16 s apart once idle.
+  const repair = resolveSyncOptions(sync).repair;
+  const previousRepairRef = useRef(repair);
+  useEffect(() => {
+    const previousRepair = previousRepairRef.current;
+    previousRepairRef.current = repair;
+    if (repair && !previousRepair) {
+      lifecycleRef.current?.compareNow();
+    }
+  }, [repair]);
 
   const peers = useMemo(() => peerRecords.map(toMeshPeer), [peerRecords]);
 
@@ -227,13 +267,6 @@ export function MeshProvider({
     (peerId: string) => peers.find((peer) => peer.id === peerId),
     [peers],
   );
-
-  const subscribeToMessages = useCallback<MeshMessageSubscribe>((listener) => {
-    messageListenersRef.current.add(listener);
-    return () => {
-      messageListenersRef.current.delete(listener);
-    };
-  }, []);
 
   const value = useMemo<MeshContextValue>(
     () => ({
@@ -244,8 +277,9 @@ export function MeshProvider({
       setDisplayName,
       peers,
       connectedPeerCount,
-      broadcast,
       getPeer,
+      publishItem,
+      addItems,
     }),
     [
       status,
@@ -255,14 +289,11 @@ export function MeshProvider({
       setDisplayName,
       peers,
       connectedPeerCount,
-      broadcast,
       getPeer,
+      publishItem,
+      addItems,
     ],
   );
 
-  return (
-    <MeshMessagesContext.Provider value={subscribeToMessages}>
-      <MeshContext.Provider value={value}>{children}</MeshContext.Provider>
-    </MeshMessagesContext.Provider>
-  );
+  return <MeshContext.Provider value={value}>{children}</MeshContext.Provider>;
 }
