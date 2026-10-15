@@ -398,7 +398,21 @@ export class MeshRouter {
       await this.publishWire(pendingPublish);
       return;
     }
-    await this.sendWire(pendingPublish);
+    // Repair packets are not retried: one written to nobody is lost until the next exchange.
+    const result = await this.sendWire(pendingPublish);
+    if (result.sentCount === 0) {
+      this.log(
+        "send",
+        "Direct packet reached no link",
+        {
+          packetType: packet.packetType,
+          targetDeviceId,
+          readyPeerCount: result.readyPeerCount,
+          connectedPeerCount: this.connectedPeerCount,
+        },
+        "warn",
+      );
+    }
   }
 
   /**
@@ -517,6 +531,19 @@ export class MeshRouter {
           readyPeerCount: result.readyPeerCount,
         });
       }
+    } catch (error) {
+      // Not re-queued: the packet is lost for every neighbour, not only the failing one.
+      this.log(
+        "send",
+        "Write failed; packet dropped",
+        {
+          wireChars: wirePayload.length,
+          excludeDeviceId,
+          message: error instanceof Error ? error.message : String(error),
+        },
+        "warn",
+      );
+      throw error;
     } finally {
       this.isPublishing = false;
       runDetached(this.log, this.flushPendingWirePayloads(), "Queue flush");

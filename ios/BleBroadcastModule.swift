@@ -11,6 +11,8 @@ private let minAttWriteBytes = 20
 private let localNamePrefix = "SM:"
 private let connectionRetryInterval: TimeInterval = 2
 private let maxMeshPeers = 8
+private let pendingConnectionWarningDelay: TimeInterval = 10
+private let outboundWriteAckWarningDelay: TimeInterval = 5
 private let meshIdFileName = "expo-mesh-device-id"
 private let itemsDirectoryName = "expo-mesh-items"
 private let itemsFileSuffix = ".jsonl"
@@ -105,6 +107,8 @@ private struct MeshPeer {
   var rssi: Int
   var meshCharacteristic: CBCharacteristic?
   var isReady: Bool
+  /// When the connection was requested: CoreBluetooth's `connect` never times out on its own.
+  var scheduledAt = Date()
 }
 
 private struct OutboundPeerTransfer {
@@ -205,6 +209,10 @@ public class BleBroadcastModule: Module {
   fileprivate let incomingWriteAssembler = IncomingAttWriteAssembler()
   fileprivate var activeSendOperation: PendingSendOperation?
   fileprivate var sendOperationQueue: [PendingSendOperation] = []
+  /// Bumped on every outbound write, so the ack watchdog knows whether the write it watches is done.
+  fileprivate var outboundWriteSerial = 0
+  /// Last "connection blocked" log per mesh ID: advertisements arrive many times a second.
+  fileprivate var blockedConnectionLoggedAt = [String: Date]()
   fileprivate var lastEmittedBluetoothState: String?
   fileprivate var cachedMeshId: String?
   /// This device's mesh ID, advertised in the local name so peers know who we are before connecting.
@@ -714,6 +722,8 @@ public class BleBroadcastModule: Module {
       }
 
       let attPayloadLimit = AttWriteFragmentation.attPayloadLimit(for: transfer.peripheral)
+      // `.withResponse` always reports 512 (long writes); this one is the real ATT MTU - 3.
+      let mtuPayloadLimit = transfer.peripheral.maximumWriteValueLength(for: .withoutResponse)
       guard let chunkData = AttWriteFragmentation.nextOutboundChunk(
         payload: transfer.payload,
         sentBytes: transfer.sentBytes,
@@ -749,16 +759,53 @@ public class BleBroadcastModule: Module {
           "attFragmentIndex": attFragmentIndex,
           "attFragmentCount": attFragmentCount,
           "usesAttLongWrite": chunkData.count > attPayloadLimit,
+          "mtuPayloadLimit": mtuPayloadLimit,
           "peerIndex": operation.currentPeerIndex + 1,
           "peerCount": operation.peerTransfers.count
         ]
       )
+      if chunkData.count > mtuPayloadLimit {
+        meshLog(
+          "gattClient",
+          "Write larger than the MTU: CoreBluetooth sends it as a prepare/execute long write",
+          detail: [
+            "deviceId": transfer.peripheral.identifier.uuidString,
+            "chunkBytes": chunkData.count,
+            "mtuPayloadLimit": mtuPayloadLimit
+          ],
+          level: "warn"
+        )
+      }
 
       transfer.peripheral.writeValue(chunkData, for: transfer.characteristic, type: .withResponse)
+      watchOutboundWriteAck(deviceId: transfer.peripheral.identifier, chunkBytes: chunkData.count)
       return
     }
 
     finishActiveSendOperation(operation)
+  }
+
+  /// Warns when a write gets no ack: the send queue waits for it, so every later packet waits too.
+  fileprivate func watchOutboundWriteAck(deviceId: UUID, chunkBytes: Int) {
+    outboundWriteSerial += 1
+    let serial = outboundWriteSerial
+    let startedAt = Date()
+    DispatchQueue.main.asyncAfter(deadline: .now() + outboundWriteAckWarningDelay) { [weak self] in
+      guard let self, self.outboundWriteSerial == serial, self.activeSendOperation != nil else {
+        return
+      }
+      self.meshLog(
+        "gattClient",
+        "Outbound write still not acknowledged",
+        detail: [
+          "deviceId": deviceId.uuidString,
+          "chunkBytes": chunkBytes,
+          "waitingMs": Int(Date().timeIntervalSince(startedAt) * 1000),
+          "queuedOperations": self.sendOperationQueue.count
+        ],
+        level: "warn"
+      )
+    }
   }
 
   fileprivate func completeOutboundWriteAck(
@@ -1197,7 +1244,10 @@ public class BleBroadcastModule: Module {
 
     // Android rotates its address, so one device can show up under several identifiers. One link
     // per device is enough; the duplicate would only waste one of the peer slots.
-    if let meshId, meshPeers.values.contains(where: { $0.meshId == meshId }) {
+    if let meshId, let existingPeer = meshPeers.values.first(where: { $0.meshId == meshId }) {
+      if !existingPeer.isReady {
+        logBlockedConnection(meshId: meshId, deviceId: deviceId, existingPeer: existingPeer)
+      }
       return
     }
 
@@ -1234,6 +1284,54 @@ public class BleBroadcastModule: Module {
       ]
     )
     centralManager?.connect(peripheral, options: nil)
+    watchPendingConnection(deviceId: deviceId)
+  }
+
+  /// Warns when a link never becomes ready: until it is cleaned up, it blocks every other
+  /// connection to the same peer (same mesh ID), so nothing is written to that peer.
+  fileprivate func watchPendingConnection(deviceId: UUID) {
+    let scheduledAt = meshPeers[deviceId]?.scheduledAt
+    DispatchQueue.main.asyncAfter(deadline: .now() + pendingConnectionWarningDelay) { [weak self] in
+      guard let self,
+            let meshPeer = self.meshPeers[deviceId],
+            meshPeer.scheduledAt == scheduledAt,
+            !meshPeer.isReady else {
+        return
+      }
+      self.meshLog(
+        "gattClient",
+        "Mesh connection still not ready",
+        detail: [
+          "deviceId": deviceId.uuidString,
+          "meshId": meshPeer.meshId ?? "null",
+          "peripheralState": meshPeer.peripheral.state.rawValue,
+          "hasCharacteristic": meshPeer.meshCharacteristic != nil,
+          "pendingMs": Int(Date().timeIntervalSince(meshPeer.scheduledAt) * 1000)
+        ],
+        level: "warn"
+      )
+      self.watchPendingConnection(deviceId: deviceId)
+    }
+  }
+
+  fileprivate func logBlockedConnection(meshId: String, deviceId: UUID, existingPeer: MeshPeer) {
+    if let loggedAt = blockedConnectionLoggedAt[meshId],
+       Date().timeIntervalSince(loggedAt) < pendingConnectionWarningDelay {
+      return
+    }
+    blockedConnectionLoggedAt[meshId] = Date()
+    meshLog(
+      "gattClient",
+      "Connection skipped: a link to this peer is still not ready",
+      detail: [
+        "meshId": meshId,
+        "deviceId": deviceId.uuidString,
+        "pendingDeviceId": existingPeer.deviceId.uuidString,
+        "peripheralState": existingPeer.peripheral.state.rawValue,
+        "pendingMs": Int(Date().timeIntervalSince(existingPeer.scheduledAt) * 1000)
+      ],
+      level: "warn"
+    )
   }
 
   fileprivate func handleConnectedPeripheral(_ peripheral: CBPeripheral) {
@@ -1344,7 +1442,21 @@ public class BleBroadcastModule: Module {
   }
 
   fileprivate func cleanupMeshPeer(for deviceId: UUID, emitDisconnect: Bool) {
-    if activeSendOperation != nil {
+    if let operation = activeSendOperation {
+      let writingTo = operation.currentPeerIndex < operation.peerTransfers.count
+        ? operation.peerTransfers[operation.currentPeerIndex].peripheral.identifier.uuidString
+        : "null"
+      meshLog(
+        "gattClient",
+        "Peer cleanup fails every pending send",
+        detail: [
+          "deviceId": deviceId.uuidString,
+          "isKnownPeer": meshPeers[deviceId] != nil,
+          "writingTo": writingTo,
+          "queuedOperations": sendOperationQueue.count
+        ],
+        level: "warn"
+      )
       failActiveSendOperation(
         Exception(name: "ERR_BLE_DISCONNECTED", description: "Peer disconnected during outbound write")
       )

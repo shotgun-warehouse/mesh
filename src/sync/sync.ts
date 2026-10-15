@@ -257,7 +257,10 @@ export class MeshSync {
    * Per neighbour, the parts of its latest request not sent yet. A new request replaces them:
    * the neighbour asks again for everything it still lacks, so older answers are stale.
    */
-  private readonly answers = new Map<string, { parts: MeshItemPart[] }>();
+  private readonly answers = new Map<
+    string,
+    { parts: MeshItemPart[]; startedAt: number }
+  >();
 
   /**
    * @param scope Hash of the sync scope (`scopeHash`): sync packets of other scopes are ignored,
@@ -461,10 +464,21 @@ export class MeshSync {
     );
     const pending = this.answers.get(deviceId);
     if (pending) {
+      // A pump stuck on a write that never completes freezes repair to this neighbour.
+      this.log(
+        "sync",
+        "Answer still sending; request replaced its parts",
+        {
+          deviceId,
+          ageMs: Date.now() - pending.startedAt,
+          parts: parts.length,
+        },
+        "warn",
+      );
       pending.parts = parts;
       return;
     }
-    const answer = { parts };
+    const answer = { parts, startedAt: Date.now() };
     this.answers.set(deviceId, answer);
     void this.pumpAnswer(deviceId, answer);
   }

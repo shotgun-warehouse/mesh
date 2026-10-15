@@ -184,6 +184,28 @@ class BleBroadcastModule : Module() {
       }
     }
 
+    override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+      meshLog(
+        tag = "gattServer",
+        message = "Central MTU changed",
+        detail = mapOf("deviceId" to device.address, "mtu" to mtu),
+      )
+    }
+
+    override fun onExecuteWrite(device: BluetoothDevice, requestId: Int, execute: Boolean) {
+      // Not answered: the central waits for its ATT timeout (30 s) before its next write.
+      meshLog(
+        tag = "gattServer",
+        message = "Execute write request left unanswered",
+        detail = mapOf(
+          "deviceId" to device.address,
+          "execute" to execute,
+          "bufferedBytes" to (preparedWriteBuffers[device.address]?.size ?: 0),
+        ),
+        level = "warn",
+      )
+    }
+
     override fun onCharacteristicReadRequest(
       device: BluetoothDevice,
       requestId: Int,
@@ -212,11 +234,34 @@ class BleBroadcastModule : Module() {
       offset: Int,
       value: ByteArray?,
     ) {
-      val server = gattServer ?: return
+      val server = gattServer
+      if (server == null) {
+        // No response: the central's write waits for its ATT timeout, and its send queue with it.
+        meshLog(
+          tag = "gattServer",
+          message = "Write request ignored: GATT server is gone",
+          detail = mapOf("deviceId" to device.address, "bytes" to (value?.size ?: 0)),
+          level = "warn",
+        )
+        return
+      }
       val chunk = value ?: ByteArray(0)
       val deviceId = device.address
 
       if (preparedWrite) {
+        // The packet was larger than the link's MTU. Chunks under 512 bytes are taken as the last
+        // one below, so a long write over a smaller MTU emits cut-off payloads.
+        meshLog(
+          tag = "gattServer",
+          message = "Prepared (long) write chunk",
+          detail = mapOf(
+            "deviceId" to deviceId,
+            "chunkBytes" to chunk.size,
+            "offset" to offset,
+            "responseNeeded" to responseNeeded,
+          ),
+          level = "warn",
+        )
         if (chunk.isNotEmpty()) {
           val accumulatedBytes = accumulatePreparedWrite(deviceId, offset, chunk)
           meshLog(
