@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2
+
+Android links to iOS peers recover on their own instead of staying dead until Bluetooth is toggled. Native change: needs a new development build.
+
+- **Android:** clears the cached GATT table before discovering services (iOS rebuilds its service on every mesh start, so cached handles go stale and every write failed with an invalid handle while the link looked ready).
+- **Android:** drops and reconnects a link on an invalid-handle write or after 3 failed writes in a row, and one that is still not ready 10 s after connecting.
+- **Android:** retries `discoverServices` when it refuses to start (another GATT operation, like the MTU request, is in flight), and logs every attempt and a missing mesh characteristic.
+
 ## 0.2.1
 
 Diagnostic logs only: no API, wire format or behaviour change. Native changes need a new development build.
