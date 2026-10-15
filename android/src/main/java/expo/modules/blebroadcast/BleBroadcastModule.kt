@@ -63,6 +63,12 @@ class BleBroadcastModule : Module() {
   private val preparedWriteBuffers = mutableMapOf<String, ByteArray>()
   /** Peers whose cached GATT table proved stale (invalid handle): cleared on their next connect. */
   private val staleGattCacheDeviceIds = mutableSetOf<String>()
+  /**
+   * MTU a peer negotiated when it connected to this GATT server. The ATT MTU belongs to the
+   * connection, which both directions share: with it known, this device's own MTU request is
+   * skipped (iOS can leave it unanswered, which blocks every later GATT operation).
+   */
+  private val serverMtuByDeviceId = mutableMapOf<String, Int>()
   private var lastEmittedBluetoothState: String? = null
   private var cachedMeshId: String? = null
   /** This device's mesh ID, advertised as service data so peers know who we are before connecting. */
@@ -186,11 +192,13 @@ class BleBroadcastModule : Module() {
         // characteristic is discovered — avoid premature connect events here.
       } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
         preparedWriteBuffers.remove(device.address)
+        serverMtuByDeviceId.remove(device.address)
         // Disconnect is handled from the GATT client peer lifecycle.
       }
     }
 
     override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+      serverMtuByDeviceId[device.address] = mtu
       meshLog(
         tag = "gattServer",
         message = "Central MTU changed",
@@ -353,10 +361,9 @@ class BleBroadcastModule : Module() {
               ),
             )
           }
-          gatt.requestMtu(517)
-          // Discovery starts once the MTU exchange is done (a discovery started during it can
-          // get no answer). iOS peripherals often never fire onMtuChanged, hence the fallback.
-          mainHandler.postDelayed({ discoverMeshServices(gatt) }, MTU_FALLBACK_DELAY_MS)
+          // Discovery first, MTU after (`markLinkReady`): an MTU request iOS leaves unanswered
+          // blocks every GATT operation queued behind it, discovery included.
+          mainHandler.postDelayed({ discoverMeshServices(gatt) }, MTU_SETTLE_DELAY_MS)
           watchLinkSetup(gatt)
         }
         BluetoothProfile.STATE_DISCONNECTED -> {
@@ -385,7 +392,7 @@ class BleBroadcastModule : Module() {
           "attPayloadLimit" to AttWriteFragmentation.attPayloadLimit(),
         ),
       )
-      mainHandler.postDelayed({ discoverMeshServices(gatt) }, MTU_SETTLE_DELAY_MS)
+      markLinkReady(gatt)
     }
 
     override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -421,6 +428,32 @@ class BleBroadcastModule : Module() {
       }
 
       peer.meshCharacteristic = characteristic
+      val serverMtu = serverMtuByDeviceId[gatt.device.address]
+      if (serverMtu != null) {
+        markLinkReady(gatt)
+        return
+      }
+      // Writes wait for the MTU (they would be refused while the request is in flight), but not
+      // forever: iOS can leave it unanswered.
+      val requested = gatt.requestMtu(517)
+      meshLog(
+        tag = "gattClient",
+        message = "Requesting MTU",
+        detail = mapOf("deviceId" to gatt.device.address, "requested" to requested),
+      )
+      if (!requested) {
+        markLinkReady(gatt)
+        return
+      }
+      mainHandler.postDelayed({ markLinkReady(gatt) }, MTU_WAIT_MS)
+    }
+
+    /** The mesh characteristic is known and the MTU settled (or given up on): writes can start. */
+    private fun markLinkReady(gatt: BluetoothGatt) {
+      val peer = meshPeers[gatt.device.address] ?: return
+      if (peer.gatt !== gatt || peer.isReady || peer.meshCharacteristic == null) {
+        return
+      }
       peer.isReady = true
       meshLog(
         tag = "gattClient",
@@ -431,6 +464,7 @@ class BleBroadcastModule : Module() {
           "rssi" to peer.rssi,
           "readyPeerCount" to meshPeers.values.count { readyPeer -> readyPeer.isReady },
           "attPayloadLimit" to AttWriteFragmentation.attPayloadLimit(),
+          "serverMtu" to serverMtuByDeviceId[gatt.device.address],
         ),
       )
       emitPeerConnected(peer.deviceId, peer.meshId, peer.deviceName, peer.rssi)
@@ -1716,7 +1750,7 @@ class BleBroadcastModule : Module() {
     /** ATT payload limit after MTU 517 negotiation (517 − 3 byte header). */
     private const val MAX_ATT_WRITE_BYTES = 512
     private const val MTU_SETTLE_DELAY_MS = 50L
-    private const val MTU_FALLBACK_DELAY_MS = 1_500L
+    private const val MTU_WAIT_MS = 2_000L
     private const val DISCOVERY_RETRY_DELAY_MS = 500L
     private const val DISCOVERY_ANSWER_TIMEOUT_MS = 3_000L
     private const val MAX_DISCOVERY_ATTEMPTS = 4

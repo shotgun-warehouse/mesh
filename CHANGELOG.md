@@ -5,7 +5,8 @@
 Fixes 0.2.2 on Android, where links to iOS peers never became ready. Native change: needs a new development build.
 
 - **Android:** the GATT cache is no longer cleared on every connect, only on the next connect to a peer whose writes failed with an invalid handle. Clearing it right before discovery made discovery never answer.
-- **Android:** service discovery starts once the MTU exchange is done (1.5 s fallback when `onMtuChanged` never fires), and a refused or unanswered discovery (3 s) is retried up to 4 times. A link not ready 15 s after connecting is dropped.
+- **Android:** services are discovered before the MTU is requested, and the MTU is only requested when the peer did not already negotiate one on the connection (as the iPhone does when it connects to this phone's GATT server). An MTU request iOS left unanswered blocked discovery, so the link never became ready. A link is ready once the MTU settles, or after 2 s.
+- **Android:** a refused or unanswered discovery (3 s) is retried up to 4 times. A link not ready 15 s after connecting is dropped.
 
 ## 0.2.2
 
