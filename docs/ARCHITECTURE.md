@@ -351,6 +351,7 @@ These are real behaviors we hit; future changes must not regress them.
 | Android  | `stopScan` and `stopAdvertising` throw `IllegalStateException` once the adapter is off                                                                  | Wrap them in `runCatching`                                                              |
 | Both     | Identity beacons reuse one packet ID, so peers drop a renamed beacon as already seen                                                                    | New identity packet ID on every rename                                                  |
 | Both     | One phone appears under several BLE identifiers (per role on iOS, address rotation on Android)                                                          | Device ID in the advertisement; peers keyed by it; one link per device ID               |
+| iOS      | Two apps embedding the mesh on one iPhone (e.g. a dev and a staging build) both publish the mesh service: iOS merges every app's services into one GATT table, so a peer can write to the **other** app. Writes succeed (status 0 on Android) yet the foreground app logs no `Accumulated ATT write fragment`; looks like random lost items, a ghost duplicate iPhone, or a Bluetooth toggle "fixing" it | When an iPhone acks writes it never logs, force-quit or delete every other build that embeds the mesh before debugging anything else |
 
 ## 5. What works today
 
