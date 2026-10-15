@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+Diagnostic logs only: no API, wire format or behaviour change. Native changes need a new development build.
+
+- **iOS:** warns when a mesh connection is still not ready after 10 s (CoreBluetooth's `connect` never times out), when a connection to a peer is skipped because an earlier link to it is still pending (throttled per peer), when an outbound write is still unacknowledged after 5 s, when a write exceeds the ATT MTU and goes out as a long write (`mtuPayloadLimit` is now in the send log), and when a peer cleanup fails every pending send.
+- **Android:** logs MTU changes from centrals, prepared (long) write chunks, unanswered execute-write requests, and write requests received after the GATT server is gone.
+- **JS:** the router warns when a direct (repair) packet reaches no link and when a write fails and the packet is dropped; sync warns when a neighbour's new request replaces an answer that is still sending, with the answer's age.
+
 ## 0.2.0
 
 - **Synced items replace messages.** `publishItem(data)` (from `useMesh()`) adds an item to a set that reaches every device of the same `syncScope`, including devices that were away when it was published. The library saves items per scope, deduplicates them, floods fresh ones and repairs gaps with neighbours (anti-entropy). `MeshProvider` gets `syncScope`, `onItemsReceived` and `sync` (knobs, read live).
