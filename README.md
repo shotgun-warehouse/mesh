@@ -1,4 +1,4 @@
-# @shotgun/mesh
+# @shotgunlive/mesh
 
 BLE mesh networking SDK for Expo apps: a native Bluetooth LE module (iOS + Android), a mesh router, and a React API.
 
@@ -7,14 +7,14 @@ Read **[docs/ARCHITECTURE.md](https://github.com/shotgun-warehouse/mesh/blob/mai
 ## Install
 
 ```sh
-npx expo install @shotgun/mesh expo-dev-client
+npx expo install @shotgunlive/mesh expo-dev-client
 ```
 
 Add the config plugin:
 
 ```ts
 // app.config.ts
-plugins: ["@shotgun/mesh"];
+plugins: ["@shotgunlive/mesh"];
 ```
 
 It declares the Android Bluetooth permissions and the `bluetooth_le` feature, and sets a default iOS Bluetooth permission text (`NSBluetoothAlwaysUsageDescription`). To use your own text, set it in `ios.infoPlist`.
@@ -37,7 +37,7 @@ The native module is autolinked. It needs a development build (`npx expo prebuil
 Wrap your app in `MeshProvider`. There is nothing to start or stop: the provider asks for Bluetooth permission, starts the mesh as soon as Bluetooth is usable, stops it when Bluetooth is turned off, and starts it again when Bluetooth comes back or the app returns to the foreground.
 
 ```tsx
-import { MeshProvider, useMesh, useMeshMessages } from "@shotgun/mesh";
+import { MeshProvider, useMesh, useMeshMessages } from "@shotgunlive/mesh";
 
 export default function App() {
   return (
@@ -81,7 +81,7 @@ On Android the permission dialog is shown once per app launch; after a denial, t
 `broadcast(json)` sends a JSON string to every nearby device. It rejects with `MeshNotRunningError` when the status is not `running`:
 
 ```ts
-import { MeshNotRunningError } from "@shotgun/mesh";
+import { MeshNotRunningError } from "@shotgunlive/mesh";
 
 try {
   await broadcast(JSON.stringify({ type: "hello" }));
@@ -149,7 +149,7 @@ pnpm ios               # or pnpm android
 pnpm start
 ```
 
-The example's Metro config resolves `@shotgun/mesh` to `../src`, so JS changes to the SDK show up without a rebuild. Changes to the config plugin need `pnpm build` at the root, then `pnpm prebuild` in the example.
+The example's Metro config resolves `@shotgunlive/mesh` to `../src`, so JS changes to the SDK show up without a rebuild. Changes to the config plugin need `pnpm build` at the root, then `pnpm prebuild` in the example.
 
 The repo is a pnpm workspace only so the example shares the SDK's dependencies (one copy of React and Expo); the published package is the repo root.
 

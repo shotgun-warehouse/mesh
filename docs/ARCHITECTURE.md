@@ -283,7 +283,7 @@ These are real behaviors we hit; future changes must not regress them.
 - Peer appears in the UI within ~1–3 s of both apps opening
 - Correct UTF-8 everywhere (emoji, accents, device names)
 - Gossip relay with dedup across ≥3 devices for non-fragmented packets
-- Packaged as a reusable SDK (`@shotgun/mesh`) with a config plugin and
+- Packaged as a reusable SDK (`@shotgunlive/mesh`) with a config plugin and
   React provider; chat app is just an example consumer
 - Hands-off lifecycle: wrapping the app in `MeshProvider` is enough; the mesh
   follows Bluetooth permission and power state on its own and reports it as a

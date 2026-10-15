@@ -1,4 +1,4 @@
-// Resolve @shotgun/mesh from the TypeScript sources in the parent folder, so the
+// Resolve @shotgunlive/mesh from the TypeScript sources in the parent folder, so the
 // example picks up SDK changes without a build step.
 const { getDefaultConfig } = require("expo/metro-config");
 const path = require("path");
@@ -10,7 +10,7 @@ const repoRoot = path.resolve(__dirname, "..");
 config.watchFolders = [...config.watchFolders, repoRoot];
 
 config.resolver.resolveRequest = (context, moduleName, platform) => {
-  if (moduleName === "@shotgun/mesh") {
+  if (moduleName === "@shotgunlive/mesh") {
     return {
       type: "sourceFile",
       filePath: path.resolve(__dirname, "..", "src", "index.ts"),

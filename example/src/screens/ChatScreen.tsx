@@ -9,7 +9,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import type { MeshPeer } from "@shotgun/mesh";
+import type { MeshPeer } from "@shotgunlive/mesh";
 
 import type { ChatMessage } from "../types";
 

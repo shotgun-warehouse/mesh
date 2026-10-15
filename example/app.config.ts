@@ -11,7 +11,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   orientation: "portrait",
   icon: "./assets/icon.png",
   userInterfaceStyle: "light",
-  plugins: ["expo-dev-client", "expo-status-bar", "@shotgun/mesh"],
+  plugins: ["expo-dev-client", "expo-status-bar", "@shotgunlive/mesh"],
   ios: {
     supportsTablet: true,
     bundleIdentifier: "com.shotgun.mesh.chat",

@@ -6,7 +6,7 @@ import {
   MeshProvider,
   useMesh,
   useMeshMessages,
-} from "@shotgun/mesh";
+} from "@shotgunlive/mesh";
 
 import { ChatScreen } from "./src/screens/ChatScreen";
 import { HomeScreen } from "./src/screens/HomeScreen";

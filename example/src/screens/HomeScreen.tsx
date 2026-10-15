@@ -8,7 +8,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { useMesh, type MeshPeer, type MeshStatus } from "@shotgun/mesh";
+import { useMesh, type MeshPeer, type MeshStatus } from "@shotgunlive/mesh";
 
 type PeerPreview = {
   peer: MeshPeer;
