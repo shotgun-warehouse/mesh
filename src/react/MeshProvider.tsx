@@ -12,6 +12,7 @@ import BleBroadcast from "../native";
 import { DEVICE_ID_BYTES } from "../mesh/constants";
 import { createDeviceId, deviceIdFromKey, isDeviceId } from "../mesh/ids";
 import { MeshLifecycle } from "../mesh/lifecycle";
+import { setMeshLogLevel, type MeshProviderLogLevel } from "../mesh/logger";
 import { resolveSyncOptions, type MeshSyncOptions } from "../sync/sync";
 
 import { MeshContext, type MeshContextValue } from "./MeshContext";
@@ -31,8 +32,12 @@ export type MeshProviderProps = {
    * the device on the mesh, like `setDisplayName`.
    */
   displayName?: string;
-  /** Verbose JS and native mesh logs. Defaults to `__DEV__`. Read once, on mount. */
-  debug?: boolean;
+  /**
+   * The least severe JS and native mesh logs printed to the console: `info` prints every log,
+   * `warn` warnings and errors, `error` errors only. Defaults to `info` in development and `warn`
+   * otherwise.
+   */
+  logLevel?: MeshProviderLogLevel;
   /**
    * Which synced item set this device works on (for example the current event ID): items are
    * saved per scope and devices only sync items of the same scope. Changing it switches sets.
@@ -105,7 +110,7 @@ function getDefaultDisplayName(): string {
 export function MeshProvider({
   children,
   displayName: displayNameProp,
-  debug = __DEV__,
+  logLevel = __DEV__ ? "info" : "warn",
   syncScope,
   deviceKey,
   onItemsReceived,
@@ -122,13 +127,17 @@ export function MeshProvider({
 
   const lifecycleRef = useRef<MeshLifecycle | null>(null);
   const displayNameRef = useRef(displayName);
-  const debugRef = useRef(debug);
   const onItemsReceivedRef = useRef(onItemsReceived);
   onItemsReceivedRef.current = onItemsReceived;
   const syncOptionsRef = useRef(sync);
   syncOptionsRef.current = sync;
   const syncScopeRef = useRef(syncScope);
   const previousDisplayNamePropRef = useRef(displayNameProp);
+
+  // Before the lifecycle effect, so the mesh's first logs already use it.
+  useEffect(() => {
+    setMeshLogLevel(logLevel);
+  }, [logLevel]);
 
   useEffect(() => {
     // BLE link → device ID, for the links this device opened (the only ones with disconnect
@@ -142,7 +151,6 @@ export function MeshProvider({
     const lifecycle = new MeshLifecycle({
       deviceId,
       displayName: displayNameRef.current,
-      debug: debugRef.current,
       onStatusChange: (nextStatus, nextError) => {
         setStatus(nextStatus);
         setError(nextError);

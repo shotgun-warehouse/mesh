@@ -2,7 +2,7 @@ import { AppState, Platform } from "react-native";
 
 import BleBroadcast, { type BluetoothState } from "../native";
 import { MAX_START_ATTEMPTS, START_RETRY_BASE_DELAY_MS } from "./constants";
-import { meshLog, setMeshLoggingEnabled } from "./logger";
+import { meshLog } from "./logger";
 import { attachNativeMeshLogs } from "./nativeLogs";
 import { nativeMeshTransport } from "./nativeTransport";
 import { requestMeshPermissions } from "./permissions";
@@ -40,7 +40,6 @@ export type MeshLifecycleOptions = {
   /** This device's ID (see `DEVICE_ID_BYTES`), sent in every packet and advertised. */
   deviceId: string;
   displayName: string;
-  debug: boolean;
   onStatusChange: (status: MeshStatus, error: string | null) => void;
   /** The mesh stopped (Bluetooth went away): every peer link is gone. */
   onSessionStopped: () => void;
@@ -147,10 +146,7 @@ export class MeshLifecycle {
       );
     }
 
-    setMeshLoggingEnabled(this.options.debug);
-    if (this.options.debug) {
-      this.nativeLogSubscription = attachNativeMeshLogs();
-    }
+    this.nativeLogSubscription = attachNativeMeshLogs();
 
     this.options.onStatusChange(this.status, this.error);
 
@@ -192,9 +188,6 @@ export class MeshLifecycle {
       await this.stopSession();
       this.nativeLogSubscription?.remove();
       this.nativeLogSubscription = null;
-      if (mountedLifecycleCount === 0) {
-        setMeshLoggingEnabled(false);
-      }
     });
   }
 

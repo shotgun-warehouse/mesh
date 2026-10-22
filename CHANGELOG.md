@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+iOS links to Android peers recover when the Android phone restarts its mesh, and apps choose how much the mesh logs. Native change: needs a new development build.
+
+- **`logLevel` prop replaces `debug`** on `MeshProvider`: `"info"` prints every JS and native mesh log, `"warn"` warnings and errors, `"error"` errors only. Defaults to `"info"` in development and `"warn"` otherwise (what `debug` did), and is read live. Native warnings and errors now reach the JS console outside development too.
+
+- **iOS:** rediscovers the mesh characteristic when a peer invalidates its service (`didModifyServices`). Android rebuilds its GATT server on every mesh start while the link stays up, so the cached characteristic pointed at a dead handle and every write failed with "The handle is invalid" while the link looked ready.
+- **iOS:** drops and reconnects a ready link whose write fails with an invalid handle or a missing attribute, in case the service change was never reported.
+- **Both:** reading the mesh characteristic returns the device's mesh ID.
+- **Android:** reads a peer's mesh ID before marking its link ready, and closes the link when this phone already has one to that device. iPhone advertisements often lack the local name carrying the ID, so an Android opened one link per rotated iPhone address; the extra setups stalled the iPhone's writes for ~20 s. The address is remembered, so its next advertisement does not connect again.
+- **Android:** a link closing only fails the send in flight when that send writes to it.
+
 ## 0.2.3
 
 Fixes 0.2.2 on Android, where links to iOS peers never became ready. Native change: needs a new development build.

@@ -17,6 +17,24 @@ private let meshIdFileName = "expo-mesh-device-id"
 private let itemsDirectoryName = "expo-mesh-items"
 private let itemsFileSuffix = ".jsonl"
 
+/// Hex (a mesh ID) as bytes; nil when it is not whole bytes of hex.
+private func bytesFromHex(_ hex: String) -> Data? {
+  guard !hex.isEmpty, hex.count % 2 == 0 else {
+    return nil
+  }
+  var bytes = Data(capacity: hex.count / 2)
+  var index = hex.startIndex
+  while index < hex.endIndex {
+    let nextIndex = hex.index(index, offsetBy: 2)
+    guard let byte = UInt8(hex[index..<nextIndex], radix: 16) else {
+      return nil
+    }
+    bytes.append(byte)
+    index = nextIndex
+  }
+  return bytes
+}
+
 private final class BleBroadcastPeripheralDelegate: NSObject, CBPeripheralManagerDelegate {
   weak var module: BleBroadcastModule?
 
@@ -34,6 +52,10 @@ private final class BleBroadcastPeripheralDelegate: NSObject, CBPeripheralManage
 
   func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
     module?.handlePeripheralManagerDidReceiveWrite(peripheral, requests: requests)
+  }
+
+  func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
+    module?.handlePeripheralManagerDidReceiveRead(peripheral, request: request)
   }
 }
 
@@ -79,6 +101,10 @@ private final class BleBroadcastCentralDelegate: NSObject, CBCentralManagerDeleg
 
   func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
     module?.handlePeripheralDidDiscoverServices(peripheral, error: error)
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+    module?.handlePeripheralDidModifyServices(peripheral, invalidatedServices: invalidatedServices)
   }
 
   func peripheral(
@@ -827,6 +853,7 @@ public class BleBroadcastModule: Module {
       failActiveSendOperation(
         Exception(name: "ERR_BLE_WRITE", description: error.localizedDescription)
       )
+      dropStaleLinkAfterWriteError(deviceId: deviceId, error: error)
       return
     }
 
@@ -975,6 +1002,24 @@ public class BleBroadcastModule: Module {
 
     pendingStartPromise?.resolve(buildResult(for: Data()))
     pendingStartPromise = nil
+  }
+
+  /// A read of the mesh characteristic returns this device's mesh ID: Android centrals identify the
+  /// link with it, as the local name carrying it is not in every advertisement they receive.
+  fileprivate func handlePeripheralManagerDidReceiveRead(_ peripheral: CBPeripheralManager, request: CBATTRequest) {
+    guard request.characteristic.uuid == characteristicUuid else {
+      peripheral.respond(to: request, withResult: .requestNotSupported)
+      return
+    }
+
+    let meshIdBytes = localMeshId.flatMap(bytesFromHex) ?? Data()
+    guard request.offset <= meshIdBytes.count else {
+      peripheral.respond(to: request, withResult: .invalidOffset)
+      return
+    }
+
+    request.value = meshIdBytes.subdata(in: request.offset..<meshIdBytes.count)
+    peripheral.respond(to: request, withResult: .success)
   }
 
   fileprivate func handlePeripheralManagerDidReceiveWrite(_ peripheral: CBPeripheralManager, requests: [CBATTRequest]) {
@@ -1381,6 +1426,58 @@ public class BleBroadcastModule: Module {
     }
 
     peripheral.discoverCharacteristics([characteristicUuid], for: meshService)
+  }
+
+  /// The peer rebuilt its GATT service (Android does on every mesh start, over a link that stays
+  /// up): the cached characteristic now points at a dead handle, so rediscover it.
+  fileprivate func handlePeripheralDidModifyServices(
+    _ peripheral: CBPeripheral,
+    invalidatedServices: [CBService]
+  ) {
+    guard invalidatedServices.contains(where: { matchesMeshServiceUuid($0.uuid) }),
+          var meshPeer = meshPeers[peripheral.identifier] else {
+      return
+    }
+
+    let wasReady = meshPeer.isReady
+    meshPeer.meshCharacteristic = nil
+    meshPeer.isReady = false
+    meshPeers[peripheral.identifier] = meshPeer
+    meshLog(
+      "gattClient",
+      "Peer invalidated the mesh service: rediscovering",
+      detail: [
+        "deviceId": peripheral.identifier.uuidString,
+        "meshId": meshPeer.meshId ?? "null",
+        "wasReady": wasReady
+      ],
+      level: "warn"
+    )
+    if wasReady {
+      emitPeerDisconnected(deviceId: peripheral.identifier.uuidString, meshId: meshPeer.meshId)
+    }
+    peripheral.discoverServices([serviceUuid, advertiseServiceUuid])
+  }
+
+  /// A write to a handle the peer no longer has fails forever: drop the link so it reconnects and
+  /// discovers the current one. Skipped when a rediscovery is already under way.
+  fileprivate func dropStaleLinkAfterWriteError(deviceId: UUID, error: Error) {
+    guard let attError = error as? CBATTError,
+          attError.code == .invalidHandle || attError.code == .attributeNotFound,
+          meshPeers[deviceId]?.isReady == true else {
+      return
+    }
+
+    meshLog(
+      "gattClient",
+      "Dropping link with a stale mesh characteristic",
+      detail: [
+        "deviceId": deviceId.uuidString,
+        "attError": attError.code.rawValue
+      ],
+      level: "warn"
+    )
+    cleanupMeshPeer(for: deviceId, emitDisconnect: true)
   }
 
   fileprivate func handlePeripheralDidDiscoverCharacteristics(

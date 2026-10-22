@@ -31,7 +31,10 @@ export type MeshIdentityEvent = {
 
 export type MeshLinkEvent = {
   bleDeviceId: string;
-  /** The peer's device ID from its advertisement; null when the advertisement lacked it. */
+  /**
+   * The peer's device ID: from its advertisement, or read from the peer before the link is ready
+   * (Android). Null when neither gave it.
+   */
   deviceId: string | null;
   deviceName: string | null;
   rssi: number;

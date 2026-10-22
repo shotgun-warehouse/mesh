@@ -69,6 +69,12 @@ class BleBroadcastModule : Module() {
    * skipped (iOS can leave it unanswered, which blocks every later GATT operation).
    */
   private val serverMtuByDeviceId = mutableMapOf<String, Int>()
+  /**
+   * Mesh IDs read from peers' mesh characteristic, by address. An iPhone's advertisement does not
+   * always carry its ID, so a duplicate link is only caught once connected; remembering the
+   * address keeps the next advertisement from that address from connecting again.
+   */
+  private val meshIdByDeviceId = mutableMapOf<String, String>()
   private var lastEmittedBluetoothState: String? = null
   private var cachedMeshId: String? = null
   /** This device's mesh ID, advertised as service data so peers know who we are before connecting. */
@@ -116,7 +122,10 @@ class BleBroadcastModule : Module() {
   private data class MeshPeer(
     val deviceId: String,
     val gatt: BluetoothGatt,
-    /** The peer's mesh device ID, read from its advertisement. Null until an advertisement carried it. */
+    /**
+     * The peer's mesh device ID: from its advertisement, then read from its mesh characteristic
+     * before the link is ready. Null only while neither gave it.
+     */
     var meshId: String?,
     var deviceName: String?,
     var rssi: Int,
@@ -227,16 +236,21 @@ class BleBroadcastModule : Module() {
       characteristic: BluetoothGattCharacteristic,
     ) {
       val server = gattServer ?: return
-      val payload = characteristic.value ?: ByteArray(0)
+      // A read of the mesh characteristic returns this device's mesh ID: centrals identify the link with it.
+      val payload = localMeshId?.let(::hexToBytes) ?: ByteArray(0)
 
       if (offset > payload.size) {
         server.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
         return
       }
 
-      val endIndex = minOf(offset + MAX_GATT_READ_CHUNK_BYTES, payload.size)
-      val value = payload.copyOfRange(offset, endIndex)
-      server.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+      server.sendResponse(
+        device,
+        requestId,
+        BluetoothGatt.GATT_SUCCESS,
+        offset,
+        payload.copyOfRange(offset, payload.size),
+      )
     }
 
     override fun onCharacteristicWriteRequest(
@@ -298,7 +312,6 @@ class BleBroadcastModule : Module() {
             val assembledPayload = preparedWriteBuffers.remove(deviceId) ?: accumulatedBytes
             queueAssembledWriteEmit(
               device = device,
-              characteristic = characteristic,
               payload = assembledPayload,
               source = "longWrite",
             )
@@ -327,7 +340,6 @@ class BleBroadcastModule : Module() {
 
       queueAssembledWriteEmit(
         device = device,
-        characteristic = characteristic,
         payload = payload,
         source = "connection",
       )
@@ -428,13 +440,85 @@ class BleBroadcastModule : Module() {
       }
 
       peer.meshCharacteristic = characteristic
-      val serverMtu = serverMtuByDeviceId[gatt.device.address]
-      if (serverMtu != null) {
+      // The advertisement may lack the peer's mesh ID (iPhones): read it before the link is ready,
+      // so a second link to a device this phone already reaches is closed right away.
+      val reading = gatt.readCharacteristic(characteristic)
+      if (!reading) {
+        meshLog(
+          tag = "gattClient",
+          message = "Could not start reading the peer's mesh ID",
+          detail = mapOf("deviceId" to gatt.device.address, "advertisedMeshId" to peer.meshId),
+          level = "warn",
+        )
+        requestLinkMtu(gatt)
+      }
+    }
+
+    override fun onCharacteristicRead(
+      gatt: BluetoothGatt,
+      characteristic: BluetoothGattCharacteristic,
+      value: ByteArray,
+      status: Int,
+    ) {
+      handlePeerMeshIdRead(gatt, value, status)
+    }
+
+    // Android 12 and lower only: Android 13 calls the overload above instead.
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onCharacteristicRead(
+      gatt: BluetoothGatt,
+      characteristic: BluetoothGattCharacteristic,
+      status: Int,
+    ) {
+      handlePeerMeshIdRead(gatt, characteristic.value ?: ByteArray(0), status)
+    }
+
+    private fun handlePeerMeshIdRead(gatt: BluetoothGatt, value: ByteArray, status: Int) {
+      val deviceId = gatt.device.address
+      val peer = meshPeers[deviceId] ?: return
+      if (peer.gatt !== gatt || peer.isReady) {
+        return
+      }
+
+      val readMeshId = if (status == BluetoothGatt.GATT_SUCCESS && value.isNotEmpty()) bytesToHex(value) else null
+      if (readMeshId == null) {
+        meshLog(
+          tag = "gattClient",
+          message = "Could not read the peer's mesh ID",
+          detail = mapOf(
+            "deviceId" to deviceId,
+            "status" to status,
+            "valueBytes" to value.size,
+            "advertisedMeshId" to peer.meshId,
+          ),
+          level = "warn",
+        )
+        requestLinkMtu(gatt)
+        return
+      }
+
+      peer.meshId = readMeshId
+      meshIdByDeviceId[deviceId] = readMeshId
+      val existingPeer = meshPeers.values.firstOrNull { otherPeer ->
+        otherPeer !== peer && otherPeer.meshId == readMeshId
+      }
+      if (existingPeer != null) {
+        closeDuplicateLink(peer, existingPeer)
+        return
+      }
+
+      requestLinkMtu(gatt)
+    }
+
+    /**
+     * Writes wait for the MTU (they would be refused while the request is in flight), but not
+     * forever: iOS can leave it unanswered.
+     */
+    private fun requestLinkMtu(gatt: BluetoothGatt) {
+      if (serverMtuByDeviceId[gatt.device.address] != null) {
         markLinkReady(gatt)
         return
       }
-      // Writes wait for the MTU (they would be refused while the request is in flight), but not
-      // forever: iOS can leave it unanswered.
       val requested = gatt.requestMtu(517)
       meshLog(
         tag = "gattClient",
@@ -883,6 +967,7 @@ class BleBroadcastModule : Module() {
     disconnectAllMeshPeers()
     preparedWriteBuffers.clear()
     lastConnectionAttemptByDevice.clear()
+    meshIdByDeviceId.clear()
     lastEmittedJsonByLink.clear()
 
     if (hadRuntime) {
@@ -1337,7 +1422,7 @@ class BleBroadcastModule : Module() {
       return
     }
 
-    scheduleMeshConnection(result, meshIdFromScanRecord(record))
+    scheduleMeshConnection(result, meshIdFromScanRecord(record) ?: meshIdByDeviceId[result.device.address])
   }
 
   private fun scheduleMeshConnection(result: ScanResult, meshId: String?) {
@@ -1509,8 +1594,32 @@ class BleBroadcastModule : Module() {
     cleanupMeshPeer(deviceId, emitDisconnect = true)
   }
 
+  /**
+   * Closes a new link that reaches a device this phone already has a link to (an iPhone seen under
+   * a new address). It was never reported as connected, so no disconnect is reported either.
+   */
+  private fun closeDuplicateLink(peer: MeshPeer, existingPeer: MeshPeer) {
+    meshLog(
+      tag = "gattClient",
+      message = "Closing duplicate link to an already linked device",
+      detail = mapOf(
+        "deviceId" to peer.deviceId,
+        "meshId" to peer.meshId,
+        "linkedDeviceId" to existingPeer.deviceId,
+        "linkedIsReady" to existingPeer.isReady,
+      ),
+    )
+    peer.gatt.disconnect()
+    cleanupMeshPeer(peer.deviceId, emitDisconnect = false)
+  }
+
   private fun cleanupMeshPeer(deviceId: String, emitDisconnect: Boolean) {
-    if (activeSendOperation != null) {
+    // Only a send writing to this link fails: closing a link that was never ready (a duplicate,
+    // a stuck setup) leaves the packet in flight to the other links alone.
+    val isSendingToLink = activeSendOperation?.peerTransfers?.any { transfer ->
+      transfer.peer.deviceId == deviceId
+    } == true
+    if (isSendingToLink) {
       failActiveSendOperation(
         CodedException(
           code = "ERR_BLE_DISCONNECTED",
@@ -1688,14 +1797,12 @@ class BleBroadcastModule : Module() {
 
   private fun queueAssembledWriteEmit(
     device: BluetoothDevice,
-    characteristic: BluetoothGattCharacteristic,
     payload: ByteArray,
     source: String,
   ) {
     mainHandler.post {
       emitAssembledWrite(
         device = device,
-        characteristic = characteristic,
         payload = payload,
         source = source,
       )
@@ -1704,12 +1811,9 @@ class BleBroadcastModule : Module() {
 
   private fun emitAssembledWrite(
     device: BluetoothDevice,
-    characteristic: BluetoothGattCharacteristic,
     payload: ByteArray,
     source: String,
   ) {
-    characteristic.value = payload
-
     val jsonMessage = Base64.encodeToString(payload, Base64.NO_WRAP)
     if (jsonMessage.isEmpty()) {
       return
@@ -1746,7 +1850,6 @@ class BleBroadcastModule : Module() {
     private const val SERVICE_UUID = "0000feed-0000-1000-8000-00805f9b34fb"
     private const val CHARACTERISTIC_UUID = "0000beef-0000-1000-8000-00805f9b34fb"
     private const val MAX_GATT_PAYLOAD_BYTES = 4096
-    private const val MAX_GATT_READ_CHUNK_BYTES = 512
     /** ATT payload limit after MTU 517 negotiation (517 − 3 byte header). */
     private const val MAX_ATT_WRITE_BYTES = 512
     private const val MTU_SETTLE_DELAY_MS = 50L
