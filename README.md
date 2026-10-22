@@ -138,14 +138,14 @@ Nearby devices see this device under its display name, which defaults to the dev
 
 `MeshProvider` props (all optional but `syncScope`):
 
-| Prop              | Default          | Description                                                                                                                                     |
-| ----------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `syncScope`       | required         | The item set to sync, or `null` for none. See [Scopes](#scopes).                                                                                |
-| `deviceKey`       | none             | Your per-install ID; the device ID is derived from it. Must stay stable per install and not be blank. See [Seeding](#seeding-from-your-server). |
-| `onItemsReceived` | none             | Items from other devices, each once. See [Receiving](#receiving).                                                                               |
-| `sync`            | library defaults | Sync knobs. See [Sync knobs](#sync-knobs).                                                                                                      |
-| `displayName`     | the device name  | Name nearby devices see. Changing it renames the device, like `setDisplayName`.                                                                 |
-| `debug`           | `__DEV__`        | Verbose JS and native logs. Read once, on mount.                                                                                                |
+| Prop              | Default                        | Description                                                                                                                                     |
+| ----------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `syncScope`       | required                       | The item set to sync, or `null` for none. See [Scopes](#scopes).                                                                                |
+| `deviceKey`       | none                           | Your per-install ID; the device ID is derived from it. Must stay stable per install and not be blank. See [Seeding](#seeding-from-your-server). |
+| `onItemsReceived` | none                           | Items from other devices, each once. See [Receiving](#receiving).                                                                               |
+| `sync`            | library defaults               | Sync knobs. See [Sync knobs](#sync-knobs).                                                                                                      |
+| `displayName`     | the device name                | Name nearby devices see. Changing it renames the device, like `setDisplayName`.                                                                 |
+| `logLevel`        | `"info"` in dev, else `"warn"` | Least severe JS and native logs printed: `"info"` (all), `"warn"` (warnings and errors) or `"error"`. Read live.                                |
 
 `useMesh()` returns:
 

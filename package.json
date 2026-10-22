@@ -1,6 +1,6 @@
 {
   "name": "@shotgunlive/mesh",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "BLE mesh networking SDK for Expo apps",
   "license": "MIT",
   "author": "Shotgun",

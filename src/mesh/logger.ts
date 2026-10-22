@@ -2,10 +2,20 @@ import { Platform } from "react-native";
 
 export type MeshLogLevel = "debug" | "info" | "warn" | "error";
 
-let meshLoggingEnabled = false;
+/** The least severe logs `MeshProvider` lets through: `info` shows every log. */
+export type MeshProviderLogLevel = "info" | "warn" | "error";
 
-export function setMeshLoggingEnabled(enabled: boolean): void {
-  meshLoggingEnabled = enabled;
+const LOG_LEVEL_RANK: Record<MeshLogLevel, number> = {
+  debug: 0,
+  info: 0,
+  warn: 1,
+  error: 2,
+};
+
+let minimumLogLevel: MeshProviderLogLevel = "warn";
+
+export function setMeshLogLevel(logLevel: MeshProviderLogLevel): void {
+  minimumLogLevel = logLevel;
 }
 
 function getPlatformLabel(): string {
@@ -32,11 +42,7 @@ export function formatMeshLogLine(
 }
 
 export function isMeshLogEmitted(level: MeshLogLevel): boolean {
-  if (meshLoggingEnabled) {
-    return true;
-  }
-
-  return level === "warn" || level === "error";
+  return LOG_LEVEL_RANK[level] >= LOG_LEVEL_RANK[minimumLogLevel];
 }
 
 /** Where the router and item sync write their logs. */
