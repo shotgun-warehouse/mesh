@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+iOS links to Android peers recover when the Android phone restarts its mesh. Native change: needs a new development build.
+
+- **iOS:** rediscovers the mesh characteristic when a peer invalidates its service (`didModifyServices`). Android rebuilds its GATT server on every mesh start while the link stays up, so the cached characteristic pointed at a dead handle and every write failed with "The handle is invalid" while the link looked ready.
+- **iOS:** drops and reconnects a ready link whose write fails with an invalid handle or a missing attribute, in case the service change was never reported.
+
 ## 0.2.3
 
 Fixes 0.2.2 on Android, where links to iOS peers never became ready. Native change: needs a new development build.

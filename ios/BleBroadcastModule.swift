@@ -81,6 +81,10 @@ private final class BleBroadcastCentralDelegate: NSObject, CBCentralManagerDeleg
     module?.handlePeripheralDidDiscoverServices(peripheral, error: error)
   }
 
+  func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+    module?.handlePeripheralDidModifyServices(peripheral, invalidatedServices: invalidatedServices)
+  }
+
   func peripheral(
     _ peripheral: CBPeripheral,
     didDiscoverCharacteristicsFor service: CBService,
@@ -827,6 +831,7 @@ public class BleBroadcastModule: Module {
       failActiveSendOperation(
         Exception(name: "ERR_BLE_WRITE", description: error.localizedDescription)
       )
+      dropStaleLinkAfterWriteError(deviceId: deviceId, error: error)
       return
     }
 
@@ -1381,6 +1386,58 @@ public class BleBroadcastModule: Module {
     }
 
     peripheral.discoverCharacteristics([characteristicUuid], for: meshService)
+  }
+
+  /// The peer rebuilt its GATT service (Android does on every mesh start, over a link that stays
+  /// up): the cached characteristic now points at a dead handle, so rediscover it.
+  fileprivate func handlePeripheralDidModifyServices(
+    _ peripheral: CBPeripheral,
+    invalidatedServices: [CBService]
+  ) {
+    guard invalidatedServices.contains(where: { matchesMeshServiceUuid($0.uuid) }),
+          var meshPeer = meshPeers[peripheral.identifier] else {
+      return
+    }
+
+    let wasReady = meshPeer.isReady
+    meshPeer.meshCharacteristic = nil
+    meshPeer.isReady = false
+    meshPeers[peripheral.identifier] = meshPeer
+    meshLog(
+      "gattClient",
+      "Peer invalidated the mesh service: rediscovering",
+      detail: [
+        "deviceId": peripheral.identifier.uuidString,
+        "meshId": meshPeer.meshId ?? "null",
+        "wasReady": wasReady
+      ],
+      level: "warn"
+    )
+    if wasReady {
+      emitPeerDisconnected(deviceId: peripheral.identifier.uuidString, meshId: meshPeer.meshId)
+    }
+    peripheral.discoverServices([serviceUuid, advertiseServiceUuid])
+  }
+
+  /// A write to a handle the peer no longer has fails forever: drop the link so it reconnects and
+  /// discovers the current one. Skipped when a rediscovery is already under way.
+  fileprivate func dropStaleLinkAfterWriteError(deviceId: UUID, error: Error) {
+    guard let attError = error as? CBATTError,
+          attError.code == .invalidHandle || attError.code == .attributeNotFound,
+          meshPeers[deviceId]?.isReady == true else {
+      return
+    }
+
+    meshLog(
+      "gattClient",
+      "Dropping link with a stale mesh characteristic",
+      detail: [
+        "deviceId": deviceId.uuidString,
+        "attError": attError.code.rawValue
+      ],
+      level: "warn"
+    )
+    cleanupMeshPeer(for: deviceId, emitDisconnect: true)
   }
 
   fileprivate func handlePeripheralDidDiscoverCharacteristics(
