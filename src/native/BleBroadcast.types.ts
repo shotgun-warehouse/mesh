@@ -20,7 +20,10 @@ export type ReceivedMessage = {
 export type PeerConnectionEvent = {
   /** BLE link identifier (not stable: one phone can appear under several). */
   deviceId: string;
-  /** The peer's mesh device ID from its advertisement; null when the advertisement lacked it. */
+  /**
+   * The peer's mesh device ID: from its advertisement, or read from the peer before the link is
+   * ready (Android). Null when neither gave it.
+   */
   meshId: string | null;
   deviceName: string | null;
   rssi: number;

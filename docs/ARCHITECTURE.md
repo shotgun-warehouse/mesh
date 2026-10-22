@@ -59,7 +59,8 @@ flooding, with larger payloads split into packet-sized parts.
 Every device plays **both roles simultaneously**:
 
 - **Peripheral** — advertises a fixed mesh service UUID (`FEED`) and runs a
-  GATT server with one writable characteristic (`BEEF`).
+  GATT server with one characteristic (`BEEF`): peers write packets to it and
+  read it to get this device's mesh ID.
 - **Central** — scans for that UUID, connects to discovered peers, and
   delivers packets by **writing** to the peer's characteristic.
 
@@ -175,10 +176,17 @@ as an echo of itself. With 2 bytes, 100 devices collide in ~7% of events; with
 
 **The ID is in the advertisement.** Android advertises it as service data on
 the mesh service; iOS cannot advertise service data, so it puts it in the
-local name (`SM:<id>`). A link is therefore identified the moment it comes up:
-`onPeerConnected` carries the peer's `meshId`. The native layer also skips a
-second connection to a device it already has a link to (Android rotates its
-address, so one phone shows up under several identifiers).
+local name (`SM:<id>`). The native layer skips a second connection to a device
+it already has a link to (phones rotate their address, so one phone shows up
+under several identifiers).
+
+**Android also reads it before a link is ready.** Android receives iPhone
+advertisements without the local name, so it cannot tell a rotated iPhone
+address from a new phone. Before marking a link ready, the Android central
+reads the mesh characteristic, which returns the peer's mesh ID. A link to a
+device it already has a link to is closed there, and the address is remembered
+so its next advertisement does not connect again. Either way,
+`onPeerConnected` carries the peer's `meshId`.
 
 **Why the BLE link identifier cannot be the identity.** We learned this twice:
 
@@ -351,6 +359,7 @@ These are real behaviors we hit; future changes must not regress them.
 | Android  | `stopScan` and `stopAdvertising` throw `IllegalStateException` once the adapter is off                                                                  | Wrap them in `runCatching`                                                              |
 | Both     | Identity beacons reuse one packet ID, so peers drop a renamed beacon as already seen                                                                    | New identity packet ID on every rename                                                  |
 | Both     | One phone appears under several BLE identifiers (per role on iOS, address rotation on Android)                                                          | Device ID in the advertisement; peers keyed by it; one link per device ID               |
+| Android  | iPhone advertisements often arrive without the local name (`SM:<id>`), so an Android connected to one iPhone once per rotated address (3 links seen); the extra connection setups stalled the iPhone's writes to it for ~20 s | Read the mesh ID from the characteristic before a link is ready; close a link to an already linked device and remember its address |
 | iOS      | Two apps embedding the mesh on one iPhone (e.g. a dev and a staging build) both publish the mesh service: iOS merges every app's services into one GATT table, so a peer can write to the **other** app. Writes succeed (status 0 on Android) yet the foreground app logs no `Accumulated ATT write fragment`; looks like random lost items, a ghost duplicate iPhone, or a Bluetooth toggle "fixing" it | When an iPhone acks writes it never logs, force-quit or delete every other build that embeds the mesh before debugging anything else |
 
 ## 5. What works today

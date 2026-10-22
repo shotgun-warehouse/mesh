@@ -17,6 +17,24 @@ private let meshIdFileName = "expo-mesh-device-id"
 private let itemsDirectoryName = "expo-mesh-items"
 private let itemsFileSuffix = ".jsonl"
 
+/// Hex (a mesh ID) as bytes; nil when it is not whole bytes of hex.
+private func bytesFromHex(_ hex: String) -> Data? {
+  guard !hex.isEmpty, hex.count % 2 == 0 else {
+    return nil
+  }
+  var bytes = Data(capacity: hex.count / 2)
+  var index = hex.startIndex
+  while index < hex.endIndex {
+    let nextIndex = hex.index(index, offsetBy: 2)
+    guard let byte = UInt8(hex[index..<nextIndex], radix: 16) else {
+      return nil
+    }
+    bytes.append(byte)
+    index = nextIndex
+  }
+  return bytes
+}
+
 private final class BleBroadcastPeripheralDelegate: NSObject, CBPeripheralManagerDelegate {
   weak var module: BleBroadcastModule?
 
@@ -34,6 +52,10 @@ private final class BleBroadcastPeripheralDelegate: NSObject, CBPeripheralManage
 
   func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
     module?.handlePeripheralManagerDidReceiveWrite(peripheral, requests: requests)
+  }
+
+  func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
+    module?.handlePeripheralManagerDidReceiveRead(peripheral, request: request)
   }
 }
 
@@ -980,6 +1002,24 @@ public class BleBroadcastModule: Module {
 
     pendingStartPromise?.resolve(buildResult(for: Data()))
     pendingStartPromise = nil
+  }
+
+  /// A read of the mesh characteristic returns this device's mesh ID: Android centrals identify the
+  /// link with it, as the local name carrying it is not in every advertisement they receive.
+  fileprivate func handlePeripheralManagerDidReceiveRead(_ peripheral: CBPeripheralManager, request: CBATTRequest) {
+    guard request.characteristic.uuid == characteristicUuid else {
+      peripheral.respond(to: request, withResult: .requestNotSupported)
+      return
+    }
+
+    let meshIdBytes = localMeshId.flatMap(bytesFromHex) ?? Data()
+    guard request.offset <= meshIdBytes.count else {
+      peripheral.respond(to: request, withResult: .invalidOffset)
+      return
+    }
+
+    request.value = meshIdBytes.subdata(in: request.offset..<meshIdBytes.count)
+    peripheral.respond(to: request, withResult: .success)
   }
 
   fileprivate func handlePeripheralManagerDidReceiveWrite(_ peripheral: CBPeripheralManager, requests: [CBATTRequest]) {
