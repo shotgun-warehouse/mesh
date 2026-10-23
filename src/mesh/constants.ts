@@ -19,10 +19,23 @@ export const START_RETRY_BASE_DELAY_MS = 1_000;
 
 export const IDENTITY_BEACON_INTERVAL_MS = 5_000;
 
-/** Max wire payloads held while no peer can accept writes; oldest are dropped first. */
+/**
+ * Max relays and beacons held while a send is in progress or no peer can accept writes; oldest are
+ * dropped first.
+ */
 export const MAX_PENDING_WIRE_PAYLOADS = 100;
 
-/** Delay between relay packet writes so the BLE stack can keep up. */
+/**
+ * Max parts of this device's own items held the same way. An item is up to 10 parts and a
+ * publish queues them all at once, so they get their own, larger cap; past it, repair delivers
+ * what was dropped.
+ */
+export const MAX_PENDING_OWN_ITEM_PAYLOADS = 1_000;
+
+/**
+ * Delay between queued relay writes, so a device in the middle of the mesh does not flood its
+ * neighbours. This device's own item parts are not paced: native ACKs already pace writes.
+ */
 export const RELAY_PUBLISH_DELAY_MS = 100;
 
 /**

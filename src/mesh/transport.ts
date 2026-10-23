@@ -18,8 +18,8 @@ export interface MeshTransport {
     listener: MeshTransportEvents[EventName],
   ): { remove: () => void };
   /**
-   * Writes one wire packet to every ready link except `excludeDeviceId` (a link ID), or, when
-   * `targetDeviceId` (a mesh device ID) is set, only to the link of that device.
+   * Sends one wire packet to every reachable peer once, except the peer behind the link
+   * `excludeDeviceId`, or, when `targetDeviceId` (a mesh device ID) is set, only to that device.
    */
   sendPacketAsync(
     wirePayload: string,

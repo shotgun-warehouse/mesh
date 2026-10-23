@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0
+
+A phone can send to a peer as soon as either of them has connected to the other, and a connection that never completes no longer blocks a peer for minutes. Seen in the field: an iPhone's connection to an Android phone that had rotated its Bluetooth address stayed pending, so the iPhone sent nothing to it and the Android listed the iPhone under its short ID. Native and wire change (new GATT characteristic): needs a new development build on every device.
+
+- **Both:** the mesh characteristic supports notifications. A central writes its device ID to a new hello characteristic (`BEF0`), then subscribes. Native sends each packet to a peer once: over its own link when ready, else as a notification over the peer's link to it. Relays skip every link to the peer a packet came from, not only the link it arrived on.
+- **Both:** `onPeerConnected` / `onPeerDisconnected` carry a `direction` (`outbound` / `inbound`), `onPeerConnected`'s `rssi` can be null, and `getConnectedPeerCountAsync` counts peers, not links. The router reports a neighbour up on its first link and down on its last, so a peer stays listed and synced while either link is up.
+- **iOS:** drops a link not ready 10 s after its connect (it only warned before), and a link still setting up after 5 s gives way to the same peer seen under a new identifier. A dropped link that never got ready no longer fails the send in flight to other peers.
+- **Android:** drops a connection attempt not connected after 10 s (the stack's own timeout is ~30 s), with the same replacement by a new address.
+- **Both:** a peer linked only inbound gets the RSSI of its last advertisement.
+- **JS:** this device's own item parts are no longer paced 100 ms apart nor dropped at the 100-entry relay cap: they have their own cap of 1,000. Publishing many items at once (a photo split into ~27 items in the example app) dropped most of their parts and took ~30 s of pacing alone.
+
 ## 0.3.0
 
 iOS links to Android peers recover when the Android phone restarts its mesh, and apps choose how much the mesh logs. Native change: needs a new development build.

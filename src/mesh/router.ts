@@ -1,9 +1,12 @@
 import type {
+  LinkDirection,
   PeerConnectionEvent,
+  PeerDisconnectionEvent,
   ReceivedMessage,
 } from "../native/BleBroadcast.types";
 import {
   IDENTITY_BEACON_INTERVAL_MS,
+  MAX_PENDING_OWN_ITEM_PAYLOADS,
   MAX_PENDING_WIRE_PAYLOADS,
   MAX_SEEN_PACKET_IDS,
   RELAY_PUBLISH_DELAY_MS,
@@ -31,24 +34,21 @@ export type MeshIdentityEvent = {
 
 export type MeshLinkEvent = {
   bleDeviceId: string;
-  /**
-   * The peer's device ID: from its advertisement, or read from the peer before the link is ready
-   * (Android). Null when neither gave it.
-   */
+  /** The peer's device ID (see `PeerConnectionEvent.meshId`). Null while unknown. */
   deviceId: string | null;
   deviceName: string | null;
-  rssi: number;
-};
-
-export type MeshLinkDisconnectEvent = {
-  bleDeviceId: string;
-  deviceId: string | null;
+  rssi: number | null;
+  direction: LinkDirection;
 };
 
 export type MeshRouterCallbacks = {
   onIdentity: (event: MeshIdentityEvent) => void;
+  /** A link came up, or its device ID became known. */
   onLinkConnected?: (event: MeshLinkEvent) => void;
-  onLinkDisconnected?: (event: MeshLinkDisconnectEvent) => void;
+  /** The first link to a device came up: it is a direct neighbour. */
+  onNeighbourUp?: (deviceId: string) => void;
+  /** The last link to a device went down. */
+  onNeighbourDown?: (deviceId: string) => void;
   onPeerCountChange?: (connectedPeerCount: number) => void;
   onRelay?: (packetId: string, ttl: number) => void;
   /** A sync packet for this device (or for every neighbour), and the link it arrived on. */
@@ -68,7 +68,29 @@ type PendingWirePublish = {
   targetDeviceId: string | null;
   /** False for periodic traffic (identity beacons) that is re-sent anyway and goes stale. */
   retryIfUnsent: boolean;
+  /**
+   * A part of an item this device published: queued under its own cap and sent without the relay
+   * pacing (`MAX_PENDING_OWN_ITEM_PAYLOADS`, `RELAY_PUBLISH_DELAY_MS`).
+   */
+  isOwnItem: boolean;
 };
+
+/** Drops the oldest entries of one kind past `limit`; returns how many went. */
+function dropOldest(
+  queue: PendingWirePublish[],
+  isOwnItem: boolean,
+  limit: number,
+): number {
+  let count = queue.filter((entry) => entry.isOwnItem === isOwnItem).length;
+  let droppedCount = 0;
+  while (count > limit) {
+    const index = queue.findIndex((entry) => entry.isOwnItem === isOwnItem);
+    queue.splice(index, 1);
+    count -= 1;
+    droppedCount += 1;
+  }
+  return droppedCount;
+}
 
 function needsRetry(
   result: {
@@ -121,7 +143,19 @@ function runDetached(
   });
 }
 
+function linkKey(event: {
+  deviceId: string;
+  direction: LinkDirection;
+}): string {
+  return `${event.direction}:${event.deviceId}`;
+}
+
 export class MeshRouter {
+  /**
+   * Link (`direction:bleDeviceId`) → the device ID it reaches, for links whose device is known. A
+   * neighbour is usually linked both ways, and stays one until its last link drops.
+   */
+  private readonly linkDevices = new Map<string, string>();
   private readonly seenPacketIds = new Set<string>();
   private readonly seenPacketOrder: string[] = [];
   private readonly pendingWirePayloads: PendingWirePublish[] = [];
@@ -200,10 +234,7 @@ export class MeshRouter {
     this.peerDisconnectedSubscription = this.transport.addListener(
       "onPeerDisconnected",
       (disconnectEvent) => {
-        this.callbacks.onLinkDisconnected?.({
-          bleDeviceId: disconnectEvent.deviceId,
-          deviceId: disconnectEvent.meshId,
-        });
+        this.handlePeerLinkDisconnected(disconnectEvent);
         runDetached(
           this.log,
           this.refreshConnectedPeerCount(),
@@ -233,6 +264,7 @@ export class MeshRouter {
     this.peerConnectedSubscription = null;
     this.peerDisconnectedSubscription = null;
     this.pendingWirePayloads.length = 0;
+    this.linkDevices.clear();
   }
 
   private async handlePeerLinkConnected(
@@ -243,6 +275,7 @@ export class MeshRouter {
       deviceId: linkEvent.meshId,
       deviceName: linkEvent.deviceName,
       rssi: linkEvent.rssi,
+      direction: linkEvent.direction,
     });
 
     this.callbacks.onLinkConnected?.({
@@ -250,11 +283,59 @@ export class MeshRouter {
       deviceId: linkEvent.meshId,
       deviceName: linkEvent.deviceName,
       rssi: linkEvent.rssi,
+      direction: linkEvent.direction,
     });
+
+    if (linkEvent.meshId) {
+      this.trackLink(linkKey(linkEvent), linkEvent.meshId);
+    }
 
     await this.refreshConnectedPeerCount();
     await this.publishIdentityBeacon();
     await this.flushPendingWirePayloads();
+  }
+
+  /** A disconnect of a link that was never reported up (or whose device was unknown) is ignored. */
+  private handlePeerLinkDisconnected(
+    disconnectEvent: PeerDisconnectionEvent,
+  ): void {
+    const key = linkKey(disconnectEvent);
+    const deviceId = this.linkDevices.get(key);
+    if (!deviceId) {
+      return;
+    }
+    this.linkDevices.delete(key);
+    this.dropNeighbourIfUnlinked(deviceId);
+  }
+
+  private trackLink(key: string, deviceId: string): void {
+    const previousDeviceId = this.linkDevices.get(key);
+    if (previousDeviceId === deviceId) {
+      return;
+    }
+    const isNewNeighbour = !this.isLinked(deviceId);
+    this.linkDevices.set(key, deviceId);
+    if (previousDeviceId) {
+      this.dropNeighbourIfUnlinked(previousDeviceId);
+    }
+    if (isNewNeighbour) {
+      this.callbacks.onNeighbourUp?.(deviceId);
+    }
+  }
+
+  private dropNeighbourIfUnlinked(deviceId: string): void {
+    if (!this.isLinked(deviceId)) {
+      this.callbacks.onNeighbourDown?.(deviceId);
+    }
+  }
+
+  private isLinked(deviceId: string): boolean {
+    for (const linkedDeviceId of this.linkDevices.values()) {
+      if (linkedDeviceId === deviceId) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private async publishIdentityBeacon(): Promise<void> {
@@ -396,6 +477,7 @@ export class MeshRouter {
       excludeDeviceId: null,
       targetDeviceId,
       retryIfUnsent: packet.ttl > 0,
+      isOwnItem: packet.ttl > 0,
     };
     if (packet.ttl > 0) {
       await this.publishWire(pendingPublish);
@@ -423,9 +505,7 @@ export class MeshRouter {
    * neighbour instead: the target's link may not carry its device ID (an iOS peer advertising in
    * the background), and the packet's recipient keeps other neighbours from acting on it.
    */
-  private async sendWire(
-    pendingPublish: PendingWirePublish,
-  ): Promise<{
+  private async sendWire(pendingPublish: PendingWirePublish): Promise<{
     sentCount: number;
     readyPeerCount: number;
     skippedExcluded: number;
@@ -459,6 +539,7 @@ export class MeshRouter {
       excludeDeviceId,
       targetDeviceId: null,
       retryIfUnsent: packet.packetType !== "identity",
+      isOwnItem: false,
     });
   }
 
@@ -469,11 +550,13 @@ export class MeshRouter {
   ): void {
     this.pendingWirePayloads.push(pendingPublish);
 
-    let droppedCount = 0;
-    while (this.pendingWirePayloads.length > MAX_PENDING_WIRE_PAYLOADS) {
-      this.pendingWirePayloads.shift();
-      droppedCount += 1;
-    }
+    const droppedCount = pendingPublish.isOwnItem
+      ? dropOldest(
+          this.pendingWirePayloads,
+          true,
+          MAX_PENDING_OWN_ITEM_PAYLOADS,
+        )
+      : dropOldest(this.pendingWirePayloads, false, MAX_PENDING_WIRE_PAYLOADS);
 
     this.log(
       "queue",
@@ -628,7 +711,9 @@ export class MeshRouter {
           remainingQueueDepth: this.pendingWirePayloads.length,
         });
 
-        await delay(RELAY_PUBLISH_DELAY_MS);
+        if (!pendingPublish.isOwnItem) {
+          await delay(RELAY_PUBLISH_DELAY_MS);
+        }
       }
     } finally {
       this.isPublishing = false;

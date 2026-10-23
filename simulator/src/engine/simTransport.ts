@@ -186,6 +186,8 @@ export class SimTransport implements MeshTransport {
       meshId,
       deviceName: this.world.labelOf(peerId),
       rssi: this.rssiTo(peerId),
+      // One simulated link per pair stands for both directions.
+      direction: "outbound" as const,
     };
     for (const listener of [...this.listeners.onPeerConnected]) {
       listener(event);
@@ -195,7 +197,7 @@ export class SimTransport implements MeshTransport {
   emitPeerDisconnected(peerId: string): void {
     const meshId = this.world.meshIdOf(peerId);
     for (const listener of [...this.listeners.onPeerDisconnected]) {
-      listener({ deviceId: meshId, meshId });
+      listener({ deviceId: meshId, meshId, direction: "outbound" });
     }
   }
 

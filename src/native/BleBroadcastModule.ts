@@ -29,14 +29,17 @@ declare class BleBroadcastModule extends NativeModule<BleBroadcastModuleEvents> 
   stopScanAsync(): Promise<void>;
   isScanningAsync(): Promise<boolean>;
   /**
-   * Writes a wire packet to every ready link except `excludeDeviceId`, or only to the link whose
-   * advertised mesh ID is `targetDeviceId` when set (none when no link carries it).
+   * Sends a wire packet to every reachable peer once, except the peer behind the link
+   * `excludeDeviceId`, or only to the peer whose mesh ID is `targetDeviceId` when set (none when no
+   * link carries it). A peer gets a write over this device's link to it, or a notification when
+   * only its link to this device is up.
    */
   sendPacketAsync(
     jsonMessage: string,
     excludeDeviceId?: string | null,
     targetDeviceId?: string | null,
   ): Promise<SendPacketResult>;
+  /** Peers reachable over a link in either direction (a peer linked both ways counts once). */
   getConnectedPeerCountAsync(): Promise<number>;
   /** Lines of the synced-items file `fileKey` (lowercase hex); empty when it does not exist. */
   readItemsAsync(fileKey: string): Promise<string[]>;

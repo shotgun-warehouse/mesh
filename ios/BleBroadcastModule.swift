@@ -5,14 +5,21 @@ import UIKit
 private let serviceUuid = CBUUID(string: "0000FEED-0000-1000-8000-00805F9B34FB")
 private let advertiseServiceUuid = CBUUID(string: "FEED")
 private let characteristicUuid = CBUUID(string: "0000BEEF-0000-1000-8000-00805F9B34FB")
+/// A central writes its mesh ID here before it subscribes, so the subscription is known by peer.
+private let helloCharacteristicUuid = CBUUID(string: "0000BEF0-0000-1000-8000-00805F9B34FB")
 private let maxGattPayloadBytes = 4096
 private let maxAttWriteBytes = 512
 private let minAttWriteBytes = 20
 private let localNamePrefix = "SM:"
 private let connectionRetryInterval: TimeInterval = 2
 private let maxMeshPeers = 8
-private let pendingConnectionWarningDelay: TimeInterval = 10
+/// CoreBluetooth's `connect` never times out, so a link must be ready (connected, characteristic
+/// found) within this, or it is dropped. Connections normally take under 4 s.
+private let linkSetupTimeout: TimeInterval = 10
+/// A link still setting up this long gives way to the same peer seen under a new identifier.
+private let linkReplaceGrace: TimeInterval = 5
 private let outboundWriteAckWarningDelay: TimeInterval = 5
+private let maxPendingNotifications = 64
 private let meshIdFileName = "expo-mesh-device-id"
 private let itemsDirectoryName = "expo-mesh-items"
 private let itemsFileSuffix = ".jsonl"
@@ -56,6 +63,26 @@ private final class BleBroadcastPeripheralDelegate: NSObject, CBPeripheralManage
 
   func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
     module?.handlePeripheralManagerDidReceiveRead(peripheral, request: request)
+  }
+
+  func peripheralManager(
+    _ peripheral: CBPeripheralManager,
+    central: CBCentral,
+    didSubscribeTo characteristic: CBCharacteristic
+  ) {
+    module?.handleCentralSubscribed(central, characteristic: characteristic)
+  }
+
+  func peripheralManager(
+    _ peripheral: CBPeripheralManager,
+    central: CBCentral,
+    didUnsubscribeFrom characteristic: CBCharacteristic
+  ) {
+    module?.handleCentralUnsubscribed(central, characteristic: characteristic)
+  }
+
+  func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+    module?.sendPendingNotifications()
   }
 }
 
@@ -122,8 +149,25 @@ private final class BleBroadcastCentralDelegate: NSObject, CBCentralManagerDeleg
   ) {
     module?.handlePeripheralDidWriteValue(peripheral, characteristic: characteristic, error: error)
   }
+
+  func peripheral(
+    _ peripheral: CBPeripheral,
+    didUpdateValueFor characteristic: CBCharacteristic,
+    error: Error?
+  ) {
+    module?.handlePeripheralDidUpdateValue(peripheral, characteristic: characteristic, error: error)
+  }
+
+  func peripheral(
+    _ peripheral: CBPeripheral,
+    didUpdateNotificationStateFor characteristic: CBCharacteristic,
+    error: Error?
+  ) {
+    module?.handlePeripheralDidUpdateNotificationState(peripheral, characteristic: characteristic, error: error)
+  }
 }
 
+/// A link this device opened to a peer (central role): packets go out as writes.
 private struct MeshPeer {
   let deviceId: UUID
   let peripheral: CBPeripheral
@@ -133,8 +177,30 @@ private struct MeshPeer {
   var rssi: Int
   var meshCharacteristic: CBCharacteristic?
   var isReady: Bool
-  /// When the connection was requested: CoreBluetooth's `connect` never times out on its own.
+  /// When link setup started (the connect, or a rediscovery after the peer rebuilt its service).
   var scheduledAt = Date()
+}
+
+/// A peer that subscribed to this device's mesh characteristic (peripheral role): packets go out
+/// as notifications. It lets this device send to a peer whose own link has not come up.
+private struct InboundLink {
+  let central: CBCentral
+  /// The peer's mesh device ID, from the hello it writes before subscribing. Nil until it arrives.
+  var meshId: String?
+}
+
+private struct PendingNotification {
+  let centralId: UUID
+  let payload: Data
+}
+
+/// One peer this device can send to, over its own link (preferred: writes are acknowledged) or,
+/// when that link is not ready, as a notification over the peer's link to this device.
+private struct PeerRoute {
+  let meshId: String?
+  var outbound: MeshPeer?
+  var inbound: (centralId: UUID, link: InboundLink)?
+  var linkIds: [String] = []
 }
 
 private struct OutboundPeerTransfer {
@@ -237,8 +303,13 @@ public class BleBroadcastModule: Module {
   fileprivate var sendOperationQueue: [PendingSendOperation] = []
   /// Bumped on every outbound write, so the ack watchdog knows whether the write it watches is done.
   fileprivate var outboundWriteSerial = 0
-  /// Last "connection blocked" log per mesh ID: advertisements arrive many times a second.
-  fileprivate var blockedConnectionLoggedAt = [String: Date]()
+  fileprivate var inboundLinks = [UUID: InboundLink]()
+  /// Mesh IDs centrals wrote to the hello characteristic. The hello comes before the subscription.
+  fileprivate var helloMeshIdByCentral = [UUID: String]()
+  /// Notifications CoreBluetooth has not taken yet: `updateValue` refuses them while its queue is full.
+  fileprivate var pendingNotifications: [PendingNotification] = []
+  /// Last RSSI in each mesh ID's advertisement: the only signal strength of a peer linked inbound only.
+  fileprivate var scanRssiByMeshId = [String: Int]()
   fileprivate var lastEmittedBluetoothState: String?
   fileprivate var cachedMeshId: String?
   /// This device's mesh ID, advertised in the local name so peers know who we are before connecting.
@@ -343,7 +414,7 @@ public class BleBroadcastModule: Module {
     }.runOnQueue(.main)
 
     AsyncFunction("getConnectedPeerCountAsync") {
-      self.meshPeers.values.filter { $0.isReady }.count
+      self.peerRoutes().count
     }.runOnQueue(.main)
 
     // Synced items: one append-only file of JSON lines per sync scope (`fileKey` is hex from JS).
@@ -553,7 +624,8 @@ public class BleBroadcastModule: Module {
   }
 
   fileprivate func resetMeshRuntime(bluetoothState: String) {
-    let hadRuntime = isAdvertising || isScanning || !meshPeers.isEmpty || activeSendOperation != nil
+    let hadRuntime = isAdvertising || isScanning || !meshPeers.isEmpty || !inboundLinks.isEmpty ||
+      activeSendOperation != nil
 
     isAdvertising = false
     isScanning = false
@@ -573,21 +645,28 @@ public class BleBroadcastModule: Module {
     }
 
     let droppedPeers = Array(meshPeers.values)
+    let droppedInboundCount = inboundLinks.count
     meshPeers.removeAll()
     pendingConnectionDeviceIds.removeAll()
     lastConnectionAttemptByDevice.removeAll()
     lastEmittedJsonByLink.removeAll()
     incomingWriteAssembler.removeAll()
+    scanRssiByMeshId.removeAll()
 
     for droppedPeer in droppedPeers {
-      emitPeerDisconnected(deviceId: droppedPeer.deviceId.uuidString, meshId: droppedPeer.meshId)
+      emitPeerDisconnected(deviceId: droppedPeer.deviceId.uuidString, meshId: droppedPeer.meshId, direction: "outbound")
     }
+    dropInboundLinks()
 
     if hadRuntime {
       meshLog(
         "bluetooth",
         "Bluetooth unavailable — mesh runtime reset",
-        detail: ["state": bluetoothState, "droppedPeerCount": droppedPeers.count],
+        detail: [
+          "state": bluetoothState,
+          "droppedPeerCount": droppedPeers.count,
+          "droppedInboundCount": droppedInboundCount
+        ],
         level: "warn"
       )
     }
@@ -634,13 +713,15 @@ public class BleBroadcastModule: Module {
       peripheralManager?.removeAllServices()
     }
     payloadCharacteristic = nil
+    dropInboundLinks()
     isAdvertising = false
     pendingStartPromise?.reject(Exception(name: "ERR_BLE_STOPPED", description: "Mesh peripheral stopped"))
     pendingStartPromise = nil
   }
 
-  /// Writes to every ready link except `excludeDeviceId`, or only to the link whose advertised
-  /// mesh ID is `targetDeviceId` when it is set.
+  /// Sends to every reachable peer once, except the peer behind the link `excludeDeviceId`, or
+  /// only to the peer whose mesh ID is `targetDeviceId` when it is set. A peer gets a write over
+  /// this device's link to it, or a notification when only its link to this device is up.
   private func sendPacket(jsonMessage: String, excludeDeviceId: String?, targetDeviceId: String?, promise: Promise) {
     guard let payload = Data(base64Encoded: jsonMessage) else {
       promise.reject(Exception(name: "ERR_BLE_PAYLOAD", description: "Unable to decode base64 wire payload"))
@@ -658,35 +739,45 @@ public class BleBroadcastModule: Module {
     }
 
     var peerTransfers: [OutboundPeerTransfer] = []
-    var readyPeerCount = 0
+    var notifiedCount = 0
     var skippedExcluded = 0
+    var skippedTooLarge = 0
+    let routes = peerRoutes()
+    // The link a relayed packet came in on, and every other link to the same peer.
+    let excludedMeshId = excludeDeviceId.flatMap(meshIdOfLink)
 
-    for meshPeer in meshPeers.values where meshPeer.isReady {
-      readyPeerCount += 1
-      let peerId = meshPeer.deviceId.uuidString
-      if peerId == excludeDeviceId {
+    for route in routes {
+      if let excludeDeviceId,
+         route.linkIds.contains(excludeDeviceId) || (excludedMeshId != nil && route.meshId == excludedMeshId) {
         skippedExcluded += 1
         continue
       }
 
-      if let targetDeviceId, meshPeer.meshId != targetDeviceId.lowercased() {
+      if let targetDeviceId, route.meshId != targetDeviceId.lowercased() {
         continue
       }
 
-      guard let characteristic = meshPeer.meshCharacteristic else {
-        continue
-      }
-
-      peerTransfers.append(
-        OutboundPeerTransfer(
-          peripheral: meshPeer.peripheral,
-          characteristic: characteristic,
-          payload: payload
+      if let meshPeer = route.outbound, let characteristic = meshPeer.meshCharacteristic {
+        peerTransfers.append(
+          OutboundPeerTransfer(
+            peripheral: meshPeer.peripheral,
+            characteristic: characteristic,
+            payload: payload
+          )
         )
-      )
+      } else if let inbound = route.inbound {
+        // A notification is one ATT packet: no long-write equivalent.
+        if payload.count > inbound.link.central.maximumUpdateValueLength {
+          skippedTooLarge += 1
+          continue
+        }
+        enqueueNotification(centralId: inbound.centralId, payload: payload)
+        notifiedCount += 1
+      }
     }
 
-    let sentCount = peerTransfers.count
+    let sentCount = peerTransfers.count + notifiedCount
+    let readyPeerCount = routes.count
 
     meshLog(
       "sendPacket",
@@ -697,12 +788,16 @@ public class BleBroadcastModule: Module {
         "excludeDeviceId": excludeDeviceId ?? "null",
         "targetDeviceId": targetDeviceId ?? "null",
         "sentCount": sentCount,
+        "notifiedCount": notifiedCount,
         "readyPeerCount": readyPeerCount,
-        "skippedExcluded": skippedExcluded
+        "skippedExcluded": skippedExcluded,
+        "skippedTooLarge": skippedTooLarge
       ]
     )
 
-    if sentCount == 0 {
+    sendPendingNotifications()
+
+    if peerTransfers.isEmpty {
       promise.resolve([
         "sentCount": sentCount,
         "readyPeerCount": readyPeerCount,
@@ -719,6 +814,85 @@ public class BleBroadcastModule: Module {
       peerTransfers: peerTransfers
     )
     enqueueSendOperation(operation)
+  }
+
+  /// Every peer this device can send to, once each: a peer linked both ways is one route.
+  fileprivate func peerRoutes() -> [PeerRoute] {
+    var routes = [String: PeerRoute]()
+
+    for meshPeer in meshPeers.values where meshPeer.isReady {
+      let linkId = meshPeer.deviceId.uuidString
+      let key = meshPeer.meshId ?? "link:\(linkId)"
+      var route = routes[key] ?? PeerRoute(meshId: meshPeer.meshId)
+      route.outbound = route.outbound ?? meshPeer
+      route.linkIds.append(linkId)
+      routes[key] = route
+    }
+
+    for (centralId, link) in inboundLinks {
+      let linkId = centralId.uuidString
+      let key = link.meshId ?? "link:\(linkId)"
+      var route = routes[key] ?? PeerRoute(meshId: link.meshId)
+      route.inbound = route.inbound ?? (centralId: centralId, link: link)
+      route.linkIds.append(linkId)
+      routes[key] = route
+    }
+
+    return Array(routes.values)
+  }
+
+  /// The mesh ID of the peer behind a link, in either direction.
+  fileprivate func meshIdOfLink(_ linkId: String) -> String? {
+    guard let uuid = UUID(uuidString: linkId) else {
+      return nil
+    }
+    return meshPeers[uuid]?.meshId ?? inboundLinks[uuid]?.meshId
+  }
+
+  fileprivate func enqueueNotification(centralId: UUID, payload: Data) {
+    pendingNotifications.append(PendingNotification(centralId: centralId, payload: payload))
+    if pendingNotifications.count > maxPendingNotifications {
+      let dropped = pendingNotifications.removeFirst()
+      meshLog(
+        "gattServer",
+        "Notification queue full: dropped the oldest",
+        detail: ["linkDeviceId": dropped.centralId.uuidString, "payloadBytes": dropped.payload.count],
+        level: "warn"
+      )
+    }
+  }
+
+  /// Hands queued notifications to CoreBluetooth until it refuses one (its queue is full); the
+  /// rest go out on `peripheralManagerIsReady(toUpdateSubscribers:)`.
+  fileprivate func sendPendingNotifications() {
+    guard let peripheralManager, let characteristic = payloadCharacteristic else {
+      pendingNotifications.removeAll()
+      return
+    }
+
+    while let notification = pendingNotifications.first {
+      guard let link = inboundLinks[notification.centralId] else {
+        pendingNotifications.removeFirst()
+        continue
+      }
+      guard peripheralManager.updateValue(
+        notification.payload,
+        for: characteristic,
+        onSubscribedCentrals: [link.central]
+      ) else {
+        return
+      }
+      pendingNotifications.removeFirst()
+      meshLog(
+        "gattServer",
+        "Sent notification",
+        detail: [
+          "linkDeviceId": notification.centralId.uuidString,
+          "meshId": link.meshId ?? "null",
+          "payloadBytes": notification.payload.count
+        ]
+      )
+    }
   }
 
   fileprivate func enqueueSendOperation(_ operation: PendingSendOperation) {
@@ -928,18 +1102,27 @@ public class BleBroadcastModule: Module {
       isAdvertising = false
     }
 
+    // Removing the service ends every subscription to it.
     peripheralManager.removeAllServices()
+    dropInboundLinks()
 
     let characteristic = CBMutableCharacteristic(
       type: characteristicUuid,
-      properties: [.read, .write, .writeWithoutResponse],
+      properties: [.read, .write, .writeWithoutResponse, .notify],
       value: nil,
       permissions: [.readable, .writeable]
     )
     payloadCharacteristic = characteristic
 
+    let helloCharacteristic = CBMutableCharacteristic(
+      type: helloCharacteristicUuid,
+      properties: [.write],
+      value: nil,
+      permissions: [.writeable]
+    )
+
     let service = CBMutableService(type: serviceUuid, primary: true)
-    service.characteristics = [characteristic]
+    service.characteristics = [characteristic, helloCharacteristic]
     peripheralManager.add(service)
   }
 
@@ -1024,6 +1207,12 @@ public class BleBroadcastModule: Module {
 
   fileprivate func handlePeripheralManagerDidReceiveWrite(_ peripheral: CBPeripheralManager, requests: [CBATTRequest]) {
     for request in requests {
+      if request.characteristic.uuid == helloCharacteristicUuid {
+        peripheral.respond(to: request, withResult: .success)
+        handleHello(central: request.central, value: request.value)
+        continue
+      }
+
       guard request.characteristic.uuid == characteristicUuid else {
         peripheral.respond(to: request, withResult: .requestNotSupported)
         continue
@@ -1156,6 +1345,97 @@ public class BleBroadcastModule: Module {
     )
   }
 
+  /// A central wrote its mesh ID before subscribing. When the subscription came first, the link
+  /// is reported again now that its peer is known.
+  fileprivate func handleHello(central: CBCentral, value: Data?) {
+    guard let value, !value.isEmpty else {
+      return
+    }
+
+    let meshId = value.map { String(format: "%02x", $0) }.joined()
+    let centralId = central.identifier
+    helloMeshIdByCentral[centralId] = meshId
+    meshLog(
+      "gattServer",
+      "Central introduced itself",
+      detail: [
+        "linkDeviceId": centralId.uuidString,
+        "meshId": meshId,
+        "isSubscribed": inboundLinks[centralId] != nil
+      ]
+    )
+
+    guard var link = inboundLinks[centralId], link.meshId != meshId else {
+      return
+    }
+    link.meshId = meshId
+    inboundLinks[centralId] = link
+    emitInboundLinkConnected(centralId: centralId, link: link)
+  }
+
+  fileprivate func handleCentralSubscribed(_ central: CBCentral, characteristic: CBCharacteristic) {
+    guard characteristic.uuid == characteristicUuid else {
+      return
+    }
+
+    let centralId = central.identifier
+    let link = InboundLink(central: central, meshId: helloMeshIdByCentral[centralId])
+    inboundLinks[centralId] = link
+    meshLog(
+      "gattServer",
+      "Central subscribed to notifications",
+      detail: [
+        "linkDeviceId": centralId.uuidString,
+        "meshId": link.meshId ?? "null",
+        "maximumUpdateValueLength": central.maximumUpdateValueLength
+      ]
+    )
+    emitInboundLinkConnected(centralId: centralId, link: link)
+  }
+
+  /// Also called when the central disconnects.
+  fileprivate func handleCentralUnsubscribed(_ central: CBCentral, characteristic: CBCharacteristic) {
+    guard characteristic.uuid == characteristicUuid else {
+      return
+    }
+
+    let centralId = central.identifier
+    helloMeshIdByCentral.removeValue(forKey: centralId)
+    incomingWriteAssembler.remove(centralId: centralId)
+    guard let link = inboundLinks.removeValue(forKey: centralId) else {
+      return
+    }
+    pendingNotifications.removeAll { $0.centralId == centralId }
+    meshLog(
+      "gattServer",
+      "Central unsubscribed",
+      detail: ["linkDeviceId": centralId.uuidString, "meshId": link.meshId ?? "null"],
+      level: "warn"
+    )
+    emitPeerDisconnected(deviceId: centralId.uuidString, meshId: link.meshId, direction: "inbound")
+  }
+
+  fileprivate func emitInboundLinkConnected(centralId: UUID, link: InboundLink) {
+    emitPeerConnected(
+      deviceId: centralId.uuidString,
+      meshId: link.meshId,
+      deviceName: nil,
+      rssi: link.meshId.flatMap { scanRssiByMeshId[$0] },
+      direction: "inbound"
+    )
+  }
+
+  /// Subscriptions end with the service (mesh stop or restart, Bluetooth off).
+  fileprivate func dropInboundLinks() {
+    let droppedLinks = inboundLinks
+    inboundLinks.removeAll()
+    helloMeshIdByCentral.removeAll()
+    pendingNotifications.removeAll()
+    for (centralId, link) in droppedLinks {
+      emitPeerDisconnected(deviceId: centralId.uuidString, meshId: link.meshId, direction: "inbound")
+    }
+  }
+
   private func startScan(promise: Promise) {
     if isScanning {
       promise.resolve(nil)
@@ -1266,6 +1546,10 @@ public class BleBroadcastModule: Module {
       return
     }
 
+    if let meshId {
+      scanRssiByMeshId[meshId] = rssi
+    }
+
     if var existingPeer = meshPeers[deviceId] {
       // Learned the ID after connecting (it came with a later scan response): report it.
       if existingPeer.meshId == nil, let meshId {
@@ -1276,7 +1560,8 @@ public class BleBroadcastModule: Module {
             deviceId: deviceId.uuidString,
             meshId: meshId,
             deviceName: existingPeer.deviceName,
-            rssi: existingPeer.rssi
+            rssi: existingPeer.rssi,
+            direction: "outbound"
           )
         }
       }
@@ -1288,12 +1573,26 @@ public class BleBroadcastModule: Module {
     }
 
     // Android rotates its address, so one device can show up under several identifiers. One link
-    // per device is enough; the duplicate would only waste one of the peer slots.
+    // per device is enough; the duplicate would only waste one of the peer slots. A link still
+    // setting up gives way to the new identifier: a connect to an address the peer no longer uses
+    // never completes.
     if let meshId, let existingPeer = meshPeers.values.first(where: { $0.meshId == meshId }) {
-      if !existingPeer.isReady {
-        logBlockedConnection(meshId: meshId, deviceId: deviceId, existingPeer: existingPeer)
+      if existingPeer.isReady || Date().timeIntervalSince(existingPeer.scheduledAt) < linkReplaceGrace {
+        return
       }
-      return
+      meshLog(
+        "gattClient",
+        "Replacing a link that is not ready with the peer's new identifier",
+        detail: [
+          "meshId": meshId,
+          "deviceId": deviceId.uuidString,
+          "replacedDeviceId": existingPeer.deviceId.uuidString,
+          "peripheralState": existingPeer.peripheral.state.rawValue,
+          "pendingMs": Int(Date().timeIntervalSince(existingPeer.scheduledAt) * 1000)
+        ],
+        level: "warn"
+      )
+      cleanupMeshPeer(for: existingPeer.deviceId, emitDisconnect: false)
     }
 
     if meshPeers.count >= maxMeshPeers {
@@ -1329,14 +1628,15 @@ public class BleBroadcastModule: Module {
       ]
     )
     centralManager?.connect(peripheral, options: nil)
-    watchPendingConnection(deviceId: deviceId)
+    watchLinkSetup(deviceId: deviceId)
   }
 
-  /// Warns when a link never becomes ready: until it is cleaned up, it blocks every other
-  /// connection to the same peer (same mesh ID), so nothing is written to that peer.
-  fileprivate func watchPendingConnection(deviceId: UUID) {
+  /// Drops a link that is not ready `linkSetupTimeout` after its setup started, so the peer's next
+  /// advertisement connects again. CoreBluetooth's `connect` never times out, and a peer that
+  /// rotated its address never answers on the old one.
+  fileprivate func watchLinkSetup(deviceId: UUID) {
     let scheduledAt = meshPeers[deviceId]?.scheduledAt
-    DispatchQueue.main.asyncAfter(deadline: .now() + pendingConnectionWarningDelay) { [weak self] in
+    DispatchQueue.main.asyncAfter(deadline: .now() + linkSetupTimeout) { [weak self] in
       guard let self,
             let meshPeer = self.meshPeers[deviceId],
             meshPeer.scheduledAt == scheduledAt,
@@ -1345,38 +1645,19 @@ public class BleBroadcastModule: Module {
       }
       self.meshLog(
         "gattClient",
-        "Mesh connection still not ready",
+        "Dropping link to reconnect: not ready in time",
         detail: [
           "deviceId": deviceId.uuidString,
           "meshId": meshPeer.meshId ?? "null",
           "peripheralState": meshPeer.peripheral.state.rawValue,
           "hasCharacteristic": meshPeer.meshCharacteristic != nil,
-          "pendingMs": Int(Date().timeIntervalSince(meshPeer.scheduledAt) * 1000)
+          "timeoutMs": Int(linkSetupTimeout * 1000)
         ],
         level: "warn"
       )
-      self.watchPendingConnection(deviceId: deviceId)
+      // Not ready, so it was never reported (or its disconnect already was).
+      self.cleanupMeshPeer(for: deviceId, emitDisconnect: false)
     }
-  }
-
-  fileprivate func logBlockedConnection(meshId: String, deviceId: UUID, existingPeer: MeshPeer) {
-    if let loggedAt = blockedConnectionLoggedAt[meshId],
-       Date().timeIntervalSince(loggedAt) < pendingConnectionWarningDelay {
-      return
-    }
-    blockedConnectionLoggedAt[meshId] = Date()
-    meshLog(
-      "gattClient",
-      "Connection skipped: a link to this peer is still not ready",
-      detail: [
-        "meshId": meshId,
-        "deviceId": deviceId.uuidString,
-        "pendingDeviceId": existingPeer.deviceId.uuidString,
-        "peripheralState": existingPeer.peripheral.state.rawValue,
-        "pendingMs": Int(Date().timeIntervalSince(existingPeer.scheduledAt) * 1000)
-      ],
-      level: "warn"
-    )
   }
 
   fileprivate func handleConnectedPeripheral(_ peripheral: CBPeripheral) {
@@ -1425,7 +1706,7 @@ public class BleBroadcastModule: Module {
       return
     }
 
-    peripheral.discoverCharacteristics([characteristicUuid], for: meshService)
+    peripheral.discoverCharacteristics([characteristicUuid, helloCharacteristicUuid], for: meshService)
   }
 
   /// The peer rebuilt its GATT service (Android does on every mesh start, over a link that stays
@@ -1442,6 +1723,7 @@ public class BleBroadcastModule: Module {
     let wasReady = meshPeer.isReady
     meshPeer.meshCharacteristic = nil
     meshPeer.isReady = false
+    meshPeer.scheduledAt = Date()
     meshPeers[peripheral.identifier] = meshPeer
     meshLog(
       "gattClient",
@@ -1454,9 +1736,10 @@ public class BleBroadcastModule: Module {
       level: "warn"
     )
     if wasReady {
-      emitPeerDisconnected(deviceId: peripheral.identifier.uuidString, meshId: meshPeer.meshId)
+      emitPeerDisconnected(deviceId: peripheral.identifier.uuidString, meshId: meshPeer.meshId, direction: "outbound")
     }
     peripheral.discoverServices([serviceUuid, advertiseServiceUuid])
+    watchLinkSetup(deviceId: peripheral.identifier)
   }
 
   /// A write to a handle the peer no longer has fails forever: drop the link so it reconnects and
@@ -1499,6 +1782,16 @@ public class BleBroadcastModule: Module {
       return
     }
 
+    // Queued ahead of any packet write: the peer learns who subscribes, then can notify this
+    // device over this link when its own link here is not up.
+    let helloCharacteristic = service.characteristics?.first(where: { $0.uuid == helloCharacteristicUuid })
+    if let helloCharacteristic, let helloBytes = localMeshId.flatMap(bytesFromHex) {
+      peripheral.writeValue(helloBytes, for: helloCharacteristic, type: .withResponse)
+    }
+    if characteristic.properties.contains(.notify) {
+      peripheral.setNotifyValue(true, for: characteristic)
+    }
+
     meshPeer.meshCharacteristic = characteristic
     meshPeer.isReady = true
     meshPeers[peripheral.identifier] = meshPeer
@@ -1515,14 +1808,17 @@ public class BleBroadcastModule: Module {
         "attFragmentCapacity": AttWriteFragmentation.estimatedAttFragmentCount(
           payloadBytes: maxGattPayloadBytes,
           attPayloadLimit: attPayloadLimit
-        )
+        ),
+        "introduced": helloCharacteristic != nil,
+        "canNotify": characteristic.properties.contains(.notify)
       ]
     )
     emitPeerConnected(
       deviceId: peripheral.identifier.uuidString,
       meshId: meshPeer.meshId,
       deviceName: peripheral.name,
-      rssi: meshPeer.rssi
+      rssi: meshPeer.rssi,
+      direction: "outbound"
     )
   }
 
@@ -1531,6 +1827,19 @@ public class BleBroadcastModule: Module {
     characteristic: CBCharacteristic,
     error: Error?
   ) {
+    // The hello is not part of a send: only its failure is worth knowing.
+    if characteristic.uuid == helloCharacteristicUuid {
+      if let error {
+        meshLog(
+          "gattClient",
+          "Hello write failed",
+          detail: ["deviceId": peripheral.identifier.uuidString, "error": error.localizedDescription],
+          level: "warn"
+        )
+      }
+      return
+    }
+
     completeOutboundWriteAck(
       deviceId: peripheral.identifier,
       payloadBytes: characteristic.value?.count ?? 0,
@@ -1538,8 +1847,64 @@ public class BleBroadcastModule: Module {
     )
   }
 
+  /// A packet the peer sent as a notification, over this device's link to it.
+  fileprivate func handlePeripheralDidUpdateValue(
+    _ peripheral: CBPeripheral,
+    characteristic: CBCharacteristic,
+    error: Error?
+  ) {
+    guard characteristic.uuid == characteristicUuid,
+          error == nil,
+          let payload = characteristic.value,
+          !payload.isEmpty else {
+      return
+    }
+
+    let jsonMessage = payload.base64EncodedString()
+    let meshPeer = meshPeers[peripheral.identifier]
+    meshLog(
+      "gattClient",
+      "Received notification",
+      detail: [
+        "deviceId": peripheral.identifier.uuidString,
+        "payloadBytes": payload.count,
+        "wireChars": jsonMessage.count
+      ]
+    )
+    emitMessage(
+      linkDeviceId: peripheral.identifier.uuidString,
+      deviceName: peripheral.name,
+      rssi: meshPeer?.rssi ?? 0,
+      jsonMessage: jsonMessage,
+      source: "connection"
+    )
+  }
+
+  fileprivate func handlePeripheralDidUpdateNotificationState(
+    _ peripheral: CBPeripheral,
+    characteristic: CBCharacteristic,
+    error: Error?
+  ) {
+    guard characteristic.uuid == characteristicUuid else {
+      return
+    }
+    meshLog(
+      "gattClient",
+      error == nil ? "Subscribed to the peer's notifications" : "Subscribing to the peer's notifications failed",
+      detail: [
+        "deviceId": peripheral.identifier.uuidString,
+        "isNotifying": characteristic.isNotifying,
+        "error": error?.localizedDescription ?? "null"
+      ],
+      level: error == nil ? "info" : "warn"
+    )
+  }
+
   fileprivate func cleanupMeshPeer(for deviceId: UUID, emitDisconnect: Bool) {
-    if let operation = activeSendOperation {
+    // Only a send writing to this link fails: dropping a link that was never ready (a stuck
+    // setup, a replaced identifier) leaves the packet in flight to the other links alone.
+    if let operation = activeSendOperation,
+       operation.peerTransfers.contains(where: { $0.peripheral.identifier == deviceId }) {
       let writingTo = operation.currentPeerIndex < operation.peerTransfers.count
         ? operation.peerTransfers[operation.currentPeerIndex].peripheral.identifier.uuidString
         : "null"
@@ -1569,8 +1934,9 @@ public class BleBroadcastModule: Module {
       centralManager?.cancelPeripheralConnection(meshPeer.peripheral)
     }
 
-    if emitDisconnect {
-      emitPeerDisconnected(deviceId: deviceId.uuidString, meshId: meshPeer.meshId)
+    // A link that is not ready was never reported, or its disconnect already was.
+    if emitDisconnect && meshPeer.isReady {
+      emitPeerDisconnected(deviceId: deviceId.uuidString, meshId: meshPeer.meshId, direction: "outbound")
     }
   }
 
@@ -1581,19 +1947,28 @@ public class BleBroadcastModule: Module {
     pendingConnectionDeviceIds.removeAll()
   }
 
-  fileprivate func emitPeerConnected(deviceId: String, meshId: String?, deviceName: String?, rssi: Int) {
+  /// `direction` is `outbound` for a link this device opened, `inbound` for a peer's subscription.
+  fileprivate func emitPeerConnected(
+    deviceId: String,
+    meshId: String?,
+    deviceName: String?,
+    rssi: Int?,
+    direction: String
+  ) {
     sendEvent("onPeerConnected", [
       "deviceId": deviceId,
       "meshId": meshId,
       "deviceName": deviceName,
-      "rssi": rssi
+      "rssi": rssi,
+      "direction": direction
     ])
   }
 
-  fileprivate func emitPeerDisconnected(deviceId: String, meshId: String?) {
+  fileprivate func emitPeerDisconnected(deviceId: String, meshId: String?, direction: String) {
     sendEvent("onPeerDisconnected", [
       "deviceId": deviceId,
-      "meshId": meshId
+      "meshId": meshId,
+      "direction": direction
     ])
   }
 

@@ -14,7 +14,6 @@ import { deviceIdFromKey } from "./ids";
 import {
   MeshRouter,
   type MeshIdentityEvent,
-  type MeshLinkDisconnectEvent,
   type MeshLinkEvent,
 } from "./router";
 
@@ -45,7 +44,8 @@ export type MeshLifecycleOptions = {
   onSessionStopped: () => void;
   onIdentity: (event: MeshIdentityEvent) => void;
   onLinkConnected: (event: MeshLinkEvent) => void;
-  onLinkDisconnected: (event: MeshLinkDisconnectEvent) => void;
+  /** The last link to a device dropped: it is no longer a direct neighbour. */
+  onNeighbourDown: (deviceId: string) => void;
   onPeerCountChange: (connectedPeerCount: number) => void;
   /** Sync knobs, read live. */
   syncOptions: () => MeshSyncOptions | undefined;
@@ -332,17 +332,17 @@ export class MeshLifecycle {
         onLinkConnected: (linkEvent) => {
           if (this.isCurrentRouter(router)) {
             this.options.onLinkConnected(linkEvent);
-            if (linkEvent.deviceId) {
-              this.itemSync.neighbourUp(linkEvent.deviceId);
-            }
           }
         },
-        onLinkDisconnected: (disconnectEvent) => {
+        onNeighbourUp: (deviceId) => {
           if (this.isCurrentRouter(router)) {
-            this.options.onLinkDisconnected(disconnectEvent);
-            if (disconnectEvent.deviceId) {
-              this.itemSync.neighbourDown(disconnectEvent.deviceId);
-            }
+            this.itemSync.neighbourUp(deviceId);
+          }
+        },
+        onNeighbourDown: (deviceId) => {
+          if (this.isCurrentRouter(router)) {
+            this.options.onNeighbourDown(deviceId);
+            this.itemSync.neighbourDown(deviceId);
           }
         },
         onSyncPacket: (packet, linkDeviceId) => {
