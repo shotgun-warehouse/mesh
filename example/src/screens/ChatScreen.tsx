@@ -1,5 +1,7 @@
 import { useMemo, useState } from "react";
+import * as ImagePicker from "expo-image-picker";
 import {
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Platform,
@@ -9,6 +11,9 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { ImageBubble } from "../components/ImageBubble";
+import { ImageComposer } from "../components/ImageComposer";
+import type { EncodedImage, SourceImage } from "../images";
 import type { MeshPeer } from "../types";
 
 import type { ChatMessage } from "../types";
@@ -20,6 +25,7 @@ type ChatScreenProps = {
   messages: ChatMessage[];
   onBack: () => void;
   onSendMessage: (text: string) => Promise<void>;
+  onSendImage: (image: EncodedImage) => Promise<void>;
 };
 
 function formatMessageTime(timestamp: number): string {
@@ -47,16 +53,20 @@ function MessageBubble({ message }: { message: ChatMessage }) {
             : styles.messageBubbleIncoming,
         ]}
       >
-        <Text
-          style={[
-            styles.messageText,
-            message.outgoing
-              ? styles.messageTextOutgoing
-              : styles.messageTextIncoming,
-          ]}
-        >
-          {message.text}
-        </Text>
+        {message.kind === "image" ? (
+          <ImageBubble image={message.image} outgoing={message.outgoing} />
+        ) : (
+          <Text
+            style={[
+              styles.messageText,
+              message.outgoing
+                ? styles.messageTextOutgoing
+                : styles.messageTextIncoming,
+            ]}
+          >
+            {message.text}
+          </Text>
+        )}
         <Text
           style={[
             styles.messageTime,
@@ -77,9 +87,11 @@ export function ChatScreen({
   messages,
   onBack,
   onSendMessage,
+  onSendImage,
 }: ChatScreenProps) {
   const [draftText, setDraftText] = useState("");
   const [isSending, setIsSending] = useState(false);
+  const [pickedImage, setPickedImage] = useState<SourceImage | null>(null);
 
   const sortedMessages = useMemo(
     () =>
@@ -101,6 +113,35 @@ export function ChatScreen({
 
     try {
       await onSendMessage(trimmedText);
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  const handlePickImage = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        quality: 1,
+      });
+      const asset = result.canceled ? undefined : result.assets[0];
+      if (asset) {
+        setPickedImage({
+          uri: asset.uri,
+          width: asset.width,
+          height: asset.height,
+        });
+      }
+    } catch (pickError) {
+      Alert.alert("Could not open photos", String(pickError));
+    }
+  };
+
+  const handleSendImage = async (image: EncodedImage) => {
+    setIsSending(true);
+    try {
+      await onSendImage(image);
+      setPickedImage(null);
     } finally {
       setIsSending(false);
     }
@@ -140,12 +181,33 @@ export function ChatScreen({
         renderItem={({ item: message }) => <MessageBubble message={message} />}
       />
 
+      {pickedImage ? (
+        <ImageComposer
+          source={pickedImage}
+          isSending={isSending}
+          onCancel={() => setPickedImage(null)}
+          onSend={(image) => void handleSendImage(image)}
+        />
+      ) : null}
+
       <View
         style={[
           styles.composer,
+          pickedImage ? styles.composerAttached : null,
           Platform.OS === "android" ? styles.composerAndroid : null,
         ]}
       >
+        <Pressable
+          onPress={() => void handlePickImage()}
+          disabled={isSending}
+          style={({ pressed }) => [
+            styles.attachButton,
+            isSending ? styles.sendButtonDisabled : null,
+            pressed ? styles.sendButtonPressed : null,
+          ]}
+        >
+          <Text style={styles.attachLabel}>📷</Text>
+        </Pressable>
         <TextInput
           value={draftText}
           onChangeText={setDraftText}
@@ -291,6 +353,20 @@ const styles = StyleSheet.create({
     backgroundColor: "#f0f2f5",
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: "#d1d7db",
+  },
+  composerAttached: {
+    borderTopWidth: 0,
+  },
+  attachButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#ffffff",
+  },
+  attachLabel: {
+    fontSize: 20,
   },
   composerAndroid: {
     paddingBottom: 10 + ANDROID_NAV_BAR_PADDING,

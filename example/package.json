@@ -14,6 +14,8 @@
     "@shotgunlive/mesh": "workspace:*",
     "expo": "~57.0.28",
     "expo-dev-client": "~57.0.20",
+    "expo-image-manipulator": "~57.0.21",
+    "expo-image-picker": "~57.0.20",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
     "react-native": "0.86.3"
