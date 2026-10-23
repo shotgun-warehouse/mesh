@@ -11,7 +11,20 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   orientation: "portrait",
   icon: "./assets/icon.png",
   userInterfaceStyle: "light",
-  plugins: ["expo-dev-client", "expo-status-bar", "@shotgunlive/mesh"],
+  plugins: [
+    "expo-dev-client",
+    "expo-status-bar",
+    "@shotgunlive/mesh",
+    [
+      "expo-image-picker",
+      {
+        photosPermission:
+          "Shotgun Mesh Chat sends the photos you pick to nearby devices over Bluetooth.",
+        cameraPermission: false,
+        microphonePermission: false,
+      },
+    ],
+  ],
   ios: {
     supportsTablet: true,
     bundleIdentifier: "com.shotgun.mesh.chat",

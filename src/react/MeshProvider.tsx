@@ -140,10 +140,6 @@ export function MeshProvider({
   }, [logLevel]);
 
   useEffect(() => {
-    // BLE link → device ID, for the links this device opened (the only ones with disconnect
-    // events). A peer is removed when its last such link drops.
-    const directLinks = new Map<string, string>();
-
     const updatePeer = (update: MeshPeerUpdate) => {
       setPeerRecords((previousPeers) => upsertPeer(previousPeers, update));
     };
@@ -156,7 +152,6 @@ export function MeshProvider({
         setError(nextError);
       },
       onSessionStopped: () => {
-        directLinks.clear();
         setPeerRecords([]);
         setConnectedPeerCount(0);
       },
@@ -173,23 +168,15 @@ export function MeshProvider({
         if (!linkEvent.deviceId) {
           return;
         }
-        directLinks.set(linkEvent.bleDeviceId, linkEvent.deviceId);
         updatePeer({
           id: linkEvent.deviceId,
           deviceName: linkEvent.deviceName,
-          rssi: linkEvent.rssi,
+          rssi: linkEvent.rssi ?? undefined,
           lastSeen: Date.now(),
         });
       },
-      onLinkDisconnected: (disconnectEvent) => {
-        const peerId = directLinks.get(disconnectEvent.bleDeviceId);
-        if (!peerId) {
-          return;
-        }
-        directLinks.delete(disconnectEvent.bleDeviceId);
-        if (![...directLinks.values()].includes(peerId)) {
-          setPeerRecords((previousPeers) => removePeer(previousPeers, peerId));
-        }
+      onNeighbourDown: (peerId) => {
+        setPeerRecords((previousPeers) => removePeer(previousPeers, peerId));
       },
       onPeerCountChange: setConnectedPeerCount,
       syncOptions: () => syncOptionsRef.current,

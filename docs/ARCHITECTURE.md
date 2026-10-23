@@ -59,10 +59,17 @@ flooding, with larger payloads split into packet-sized parts.
 Every device plays **both roles simultaneously**:
 
 - **Peripheral** — advertises a fixed mesh service UUID (`FEED`) and runs a
-  GATT server with one characteristic (`BEEF`): peers write packets to it and
-  read it to get this device's mesh ID.
+  GATT server with a mesh characteristic (`BEEF`): peers write packets to it,
+  read it to get this device's mesh ID, and subscribe to it to receive packets
+  as **notifications**. A second characteristic (`BEF0`) takes the
+  subscriber's mesh ID (its "hello").
 - **Central** — scans for that UUID, connects to discovered peers, and
-  delivers packets by **writing** to the peer's characteristic.
+  delivers packets by **writing** to the peer's characteristic. It also writes
+  its hello and subscribes, so the peer can send back over the same link.
+
+So two phones are usually linked twice: once each way. Native sends each
+packet to a peer **once**, over this device's own link to it when that link
+is ready, else as a notification over the peer's link to this device (3.11).
 
 The JS↔native boundary carries **base64 strings**; the air carries raw binary.
 
@@ -71,21 +78,23 @@ The JS↔native boundary carries **base64 strings**; the air carries raw binary.
 1. Sync splits the item into parts and builds one `MeshSessionPacket` per part
    (`packets.ts`).
 2. Each packet is encoded to compact binary (`binaryWire.ts`), then base64.
-3. Native decodes base64 and writes the raw bytes to every ready peer's
-   characteristic, one ATT write at a time, waiting for each ACK.
+3. Native decodes base64 and sends the raw bytes to every reachable peer once:
+   a write to the peer's characteristic, one ATT write at a time waiting for
+   each ACK, or a notification when only the peer's link to this device is up.
 4. The receiving GATT server reassembles any ATT-level chunks, base64-encodes,
    and emits to JS.
 5. The JS router dedups by packet ID, hands the part to sync (which saves the
    item once all its parts are in and passes it to the app), and **relays**
-   the packet (TTL − 1) to all links except the one it arrived on.
+   the packet (TTL − 1) to every neighbour except the one it arrived from.
 
 ## 3. Key design decisions and why
 
 ### 3.1 GATT writes, not advertisements
 
 Advertisement payloads are ~27 bytes and unreliable for data. We advertise
-**only** a service UUID for discovery; all data moves over persistent GATT
-connections. This is the single most load-bearing decision — everything else
+**only** a service UUID (and the device ID, 3.7) for discovery; all data moves
+over persistent GATT connections: writes, and notifications back over a peer's
+link (3.11). This is the single most load-bearing decision — everything else
 (MTU negotiation, serial writes, splitting items into parts) follows from it.
 
 ### 3.2 512-byte packet ceiling (`MAX_WIRE_BYTES`)
@@ -128,12 +137,21 @@ encoding made compression unnecessary at these sizes.
 ### 3.4 Serial outbound writes with ACK
 
 Both native modules maintain a **single in-flight write** at a time, per send
-operation, waiting for the ATT write ACK before the next write. Firing
+operation, waiting for the ATT write ACK before the next write. Notifications
+(3.11) have no ACK; they are paced by the platform instead. Firing
 writes concurrently caused silent drops and disconnects on both platforms.
 Link-local sync writes get no JS pacing on top: the native layer already
 provides backpressure. (An early 200 ms delay between packets was the main
 cost of 10-second sends.) Relays queued while a send is in progress go out
-100 ms apart.
+100 ms apart, at most 100 waiting (oldest dropped). This device's own item
+parts are not paced and have their own cap of 1,000: a publish queues all of an
+item's parts at once (a photo in the example app is ~270), and the old shared
+cap of 100 dropped most of them while the 100 ms pacing alone took ~30 s. In the
+simulator this converges a 40-item burst in 18 s instead of 24 s; without
+repair, the faster pushes overflow neighbours' relay queues (59 of 117 burst
+items lost), which repair recovers as soon as it is on. A relay cap of 300 loses
+nothing then but costs ~20–30% more writes per item with repair on, so it stays
+at 100.
 
 ### 3.5 Item parts instead of transfers
 
@@ -148,8 +166,9 @@ any more.
 ### 3.6 Gossip flooding with TTL, no routing
 
 Packets carry a TTL (`pushHops`, default 7, for fresh items;
-`IDENTITY_TTL = 4` for beacons; 0 for link-local repair traffic). Every node relays every unseen packet to all links except the
-arrival link. Dedup is an in-memory set of the last 500 packet IDs. This is
+`IDENTITY_TTL = 4` for beacons; 0 for link-local repair traffic). Every node relays every unseen packet to every neighbour
+except the one it arrived from (native resolves the arrival link to its peer, so
+neither of that peer's links gets it back). Dedup is an in-memory set of the last 500 packet IDs. This is
 deliberately dumb: for ≤8 peers, flooding is simpler and more robust than
 routing.
 
@@ -178,7 +197,8 @@ as an echo of itself. With 2 bytes, 100 devices collide in ~7% of events; with
 the mesh service; iOS cannot advertise service data, so it puts it in the
 local name (`SM:<id>`). The native layer skips a second connection to a device
 it already has a link to (phones rotate their address, so one phone shows up
-under several identifiers).
+under several identifiers). A link still setting up after 5 s gives way to the
+same device seen under a new identifier instead (3.11).
 
 **Android also reads it before a link is ready.** Android receives iPhone
 advertisements without the local name, so it cannot tell a rotated iPhone
@@ -204,7 +224,9 @@ so its next advertisement does not connect again. Either way,
 A link whose advertisement lacked the ID (iOS apps in the background drop the
 local name) adds nothing; the peer appears when its identity packet arrives,
 which is pushed **immediately on link-up** (plus every 5 s). A peer is removed
-when the last link this device opened to it disconnects.
+when its last link, in either direction, disconnects: the router counts links
+per device ID and reports a neighbour up on its first link and down on its
+last, for the peer list and for sync alike.
 
 ### 3.8 Base64 at the JS↔native bridge
 
@@ -315,8 +337,8 @@ grow-only set (one set per **scope**, e.g. an event). An item is
   16 s apart once idle.
 - **Link-local traffic.** Digests, vectors, requests and answers have TTL 0
   (never relayed). Vectors, requests and answers are addressed to one
-  neighbour: `sendPacketAsync` takes a target mesh ID, matched against the
-  ID each link advertised. When no link carries it (an iOS peer advertising in
+  neighbour: `sendPacketAsync` takes a target mesh ID, matched against each
+  route's mesh ID (3.11). When no link carries it (an iOS peer advertising in
   the background), the packet goes to every neighbour and its recipient ID
   makes the others ignore it. Link-local packets bypass the relay queue and
   its pacing; an answer goes out one packet at a time, and a newer request
@@ -337,6 +359,56 @@ grow-only set (one set per **scope**, e.g. an event). An item is
 - **Knobs.** `repair`, `pushHops`, the two digest intervals and
   `maxItemsPerRequest` are `MeshProvider` props read live, so an app can tune
   them without a library release. `simulator/` measures them (`pnpm sim:bench`).
+
+### 3.11 Links in both directions, one route per peer
+
+Each phone connects to the other as a central, so a pair is usually linked
+twice. Until 0.4.0 a phone could only send over the link **it** opened. When
+that link never came up, the phone was mute towards that peer even though the
+peer's link to it worked: an iPhone's connect to an Android address that had
+since rotated stayed pending for minutes (CoreBluetooth's `connect` never times
+out), so the iPhone sent nothing, the Android never got its identity packet,
+and it listed the iPhone under its short ID.
+
+**Notifications make either link enough.** A central, once it found the mesh
+characteristic, writes its mesh ID to the hello characteristic and subscribes
+to the mesh characteristic. The peripheral keeps each subscription as an
+**inbound link**, known by peer from the hello (the hello comes first; if it
+arrives late, the link is reported again with its ID). Native then builds one
+**route** per peer (by mesh ID) from both kinds of links and sends each packet
+once per route:
+
+- over the **outbound** link (this device's own) when it is ready: writes are
+  acknowledged, and it is the path every earlier version proved;
+- else as a **notification** on the inbound link. A notification is one ATT
+  packet, so a packet larger than the subscriber's MTU − 3 is skipped
+  (`skippedTooLarge`) and reaches that peer once a link that can carry it is
+  up. Android centrals request MTU 517, so mesh packets usually fit.
+
+Notifications have no ATT acknowledgement (the link layer still retransmits),
+and flow control is per platform: iOS's `updateValue` refuses a packet while
+CoreBluetooth's queue is full, and the rest wait for
+`peripheralManagerIsReady(toUpdateSubscribers:)`; Android's server takes one
+notification at a time, the next after `onNotificationSent` (or 2 s). Both
+queue at most 64 and drop the oldest.
+
+`getConnectedPeerCountAsync` and `readyPeerCount` count routes, not links, and
+link events carry a `direction` (`outbound` / `inbound`) because an outbound
+and an inbound link can share a BLE identifier on Android. An inbound link has
+no RSSI of its own: its event carries the last RSSI seen in that peer's
+advertisement.
+
+**Link setup is bounded.** The research behind this (bitchat, Herald, Google
+Nearby, Meshtastic all cancel a pending connect after 8–12 s; Berty's iOS driver
+does not and has this exact bug) gave two rules:
+
+- **Timeout.** iOS drops a link not ready 10 s after its connect (or after a
+  rediscovery started) and cancels the connection. Android drops one not
+  connected after 10 s and one connected but not ready after 15 s.
+- **A new identifier replaces a stuck link.** When the same mesh ID shows up
+  under another identifier while the link to it is still setting up after 5 s,
+  the old link is dropped and the new identifier connects. Apple: a device
+  using a rotating address must be rediscovered. A ready link is never replaced.
 
 ## 4. Platform-specific landmines (encountered and fixed)
 
@@ -360,6 +432,9 @@ These are real behaviors we hit; future changes must not regress them.
 | Both     | Identity beacons reuse one packet ID, so peers drop a renamed beacon as already seen                                                                    | New identity packet ID on every rename                                                  |
 | Both     | One phone appears under several BLE identifiers (per role on iOS, address rotation on Android)                                                          | Device ID in the advertisement; peers keyed by it; one link per device ID               |
 | Android  | iPhone advertisements often arrive without the local name (`SM:<id>`), so an Android connected to one iPhone once per rotated address (3 links seen); the extra connection setups stalled the iPhone's writes to it for ~20 s | Read the mesh ID from the characteristic before a link is ready; close a link to an already linked device and remember its address |
+| iOS      | CoreBluetooth's `connect` never times out; an Android peer that rotated its address never answers on the old one, and that pending link blocked every connection to the peer's new identifiers (same mesh ID): the iPhone could not send to it for minutes | Drop a link not ready 10 s after its connect; a link still setting up gives way to the peer's new identifier after 5 s; notifications let the peer's own link carry this device's packets meanwhile (3.11) |
+| Android  | Before Android 13, notifications arrive in the deprecated `onCharacteristicChanged(gatt, characteristic)`, whose `characteristic.value` the next notification overwrites | Copy the value inside the callback, before posting it to the main thread |
+| Android  | A GATT server sends one notification at a time; the next before `onNotificationSent` is refused | Queue notifications; send the next on `onNotificationSent`, or after 2 s without it |
 | iOS      | Two apps embedding the mesh on one iPhone (e.g. a dev and a staging build) both publish the mesh service: iOS merges every app's services into one GATT table, so a peer can write to the **other** app. Writes succeed (status 0 on Android) yet the foreground app logs no `Accumulated ATT write fragment`; looks like random lost items, a ghost duplicate iPhone, or a Bluetooth toggle "fixing" it | When an iPhone acks writes it never logs, force-quit or delete every other build that embeds the mesh before debugging anything else |
 
 ## 5. What works today
@@ -385,7 +460,8 @@ beyond the dedup window. Anyone with the UUIDs can join, read, and inject.
 Fine for a demo; not fine for real ticket sales.
 
 **No acknowledgment above the ATT layer, by design.** Delivery is confirmed
-per ATT write per link; there is no end-to-end receipt. Repair replaces it:
+per ATT write per link (notifications, used when only the peer's link is up,
+are not acknowledged even there); there is no end-to-end receipt. Repair replaces it:
 neighbours keep comparing sets and re-send what is missing, so an item a
 device missed (a lost part, a link dropped mid-flood) arrives later instead
 of being lost.
@@ -442,10 +518,11 @@ but it is not private.
 | ------------------- | ---------------------------------------------------------------------------- |
 | **Packet**          | One ≤512 B wire unit (identity, item part, or repair packet)                 |
 | **Part**            | A slice of an item's data (≤440 B) that fits one packet                      |
-| **Link**            | A live GATT connection to a directly-reachable peer                          |
+| **Link**            | A GATT connection to a direct neighbour: outbound (this device connected and writes) or inbound (the peer connected and subscribed; this device notifies) |
+| **Route**           | One peer as native sends to it: its outbound link if ready, else its inbound link |
 | **Peer**            | A mesh participant, identified by its 4-byte device ID                       |
 | **Identity beacon** | Periodic packet mapping device ID → display name                             |
-| **Gossip / relay**  | Re-broadcasting unseen packets on all links except the arrival link, TTL − 1 |
+| **Gossip / relay**  | Re-broadcasting unseen packets to every neighbour except the sender's, TTL − 1 |
 | **Item**            | One element of the synced set: `(author, seq, createdAt, data)`              |
 | **Scope**           | Which set a device syncs (e.g. an event); other scopes are ignored           |
 | **Version vector**  | Per author, the highest seq held with no gap below it                        |

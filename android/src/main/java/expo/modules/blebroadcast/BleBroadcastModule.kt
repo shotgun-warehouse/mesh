@@ -5,11 +5,13 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattServer
 import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
@@ -44,6 +46,9 @@ import java.util.UUID
 class BleBroadcastModule : Module() {
   private val serviceUuid = UUID.fromString(SERVICE_UUID)
   private val characteristicUuid = UUID.fromString(CHARACTERISTIC_UUID)
+  /** A central writes its mesh ID here before it subscribes, so the subscription is known by peer. */
+  private val helloCharacteristicUuid = UUID.fromString(HELLO_CHARACTERISTIC_UUID)
+  private val clientConfigDescriptorUuid = UUID.fromString(CLIENT_CONFIG_DESCRIPTOR_UUID)
 
   private var bluetoothManager: BluetoothManager? = null
   private var bluetoothAdapter: BluetoothAdapter? = null
@@ -75,6 +80,18 @@ class BleBroadcastModule : Module() {
    * address keeps the next advertisement from that address from connecting again.
    */
   private val meshIdByDeviceId = mutableMapOf<String, String>()
+  /** Peers subscribed to this device's mesh characteristic, by address. Touched on the main thread. */
+  private val inboundLinks = mutableMapOf<String, InboundLink>()
+  /** Mesh IDs centrals wrote to the hello characteristic. The hello comes before the subscription. */
+  private val helloMeshIdByDeviceId = mutableMapOf<String, String>()
+  /** Notifications waiting for the one in flight: the server sends one at a time. */
+  private val pendingNotifications = ArrayDeque<PendingNotification>()
+  /** Address of the notification awaiting `onNotificationSent`. */
+  private var notificationInFlight: String? = null
+  /** Bumped on every notification, so its watchdog knows whether the one it watches is done. */
+  private var notificationSerial = 0
+  /** Last RSSI in each mesh ID's advertisement: the only signal strength of a peer linked inbound only. */
+  private val scanRssiByMeshId = mutableMapOf<String, Int>()
   private var lastEmittedBluetoothState: String? = null
   private var cachedMeshId: String? = null
   /** This device's mesh ID, advertised as service data so peers know who we are before connecting. */
@@ -119,6 +136,7 @@ class BleBroadcastModule : Module() {
     )
   }
 
+  /** A link this device opened to a peer (central role): packets go out as writes. */
   private data class MeshPeer(
     val deviceId: String,
     val gatt: BluetoothGatt,
@@ -130,12 +148,38 @@ class BleBroadcastModule : Module() {
     var deviceName: String?,
     var rssi: Int,
     var meshCharacteristic: BluetoothGattCharacteristic?,
+    var helloCharacteristic: BluetoothGattCharacteristic? = null,
+    var isConnected: Boolean = false,
     var isReady: Boolean = false,
     var isDiscovering: Boolean = false,
     var discoveryAttempts: Int = 0,
     /** Failed writes in a row on this link; reset by any successful write. */
     var consecutiveWriteFailures: Int = 0,
+    val scheduledAt: Long = System.currentTimeMillis(),
   )
+
+  /**
+   * A peer that subscribed to this device's mesh characteristic (peripheral role): packets go out
+   * as notifications. It lets this device send to a peer whose own link has not come up.
+   */
+  private data class InboundLink(
+    val deviceId: String,
+    val device: BluetoothDevice,
+    /** The peer's mesh device ID, from the hello it writes before subscribing. Null until it arrives. */
+    var meshId: String?,
+  )
+
+  private class PendingNotification(val deviceId: String, val payload: ByteArray)
+
+  /**
+   * One peer this device can send to, over its own link (preferred: writes are acknowledged) or,
+   * when that link is not ready, as a notification over the peer's link to this device.
+   */
+  private class PeerRoute(val meshId: String?) {
+    var outbound: MeshPeer? = null
+    var inbound: InboundLink? = null
+    val linkIds = mutableSetOf<String>()
+  }
 
   private data class OutboundPeerTransfer(
     val peer: MeshPeer,
@@ -202,8 +246,61 @@ class BleBroadcastModule : Module() {
       } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
         preparedWriteBuffers.remove(device.address)
         serverMtuByDeviceId.remove(device.address)
-        // Disconnect is handled from the GATT client peer lifecycle.
+        // Outbound links are handled from the GATT client peer lifecycle; a subscription ends here.
+        mainHandler.post {
+          helloMeshIdByDeviceId.remove(device.address)
+          removeInboundLink(device.address, "Central disconnected")
+        }
       }
+    }
+
+    override fun onDescriptorWriteRequest(
+      device: BluetoothDevice,
+      requestId: Int,
+      descriptor: BluetoothGattDescriptor,
+      preparedWrite: Boolean,
+      responseNeeded: Boolean,
+      offset: Int,
+      value: ByteArray?,
+    ) {
+      val server = gattServer ?: return
+      if (descriptor.uuid != clientConfigDescriptorUuid) {
+        if (responseNeeded) {
+          server.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
+        }
+        return
+      }
+
+      if (responseNeeded) {
+        server.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+      }
+      val subscribes = value != null && !value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)
+      mainHandler.post {
+        if (subscribes) {
+          addInboundLink(device)
+        } else {
+          removeInboundLink(device.address, "Central unsubscribed")
+        }
+      }
+    }
+
+    override fun onDescriptorReadRequest(
+      device: BluetoothDevice,
+      requestId: Int,
+      offset: Int,
+      descriptor: BluetoothGattDescriptor,
+    ) {
+      val server = gattServer ?: return
+      val value = if (inboundLinks.containsKey(device.address)) {
+        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+      } else {
+        BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+      }
+      server.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value)
+    }
+
+    override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+      mainHandler.post { handleNotificationSent(device.address, status) }
     }
 
     override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
@@ -275,6 +372,14 @@ class BleBroadcastModule : Module() {
       }
       val chunk = value ?: ByteArray(0)
       val deviceId = device.address
+
+      if (characteristic.uuid == helloCharacteristicUuid) {
+        if (responseNeeded) {
+          server.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
+        }
+        mainHandler.post { handleHello(device, chunk) }
+        return
+      }
 
       if (preparedWrite) {
         // The packet was larger than the link's MTU. Chunks under 512 bytes are taken as the last
@@ -357,6 +462,7 @@ class BleBroadcastModule : Module() {
 
       when (newState) {
         BluetoothProfile.STATE_CONNECTED -> {
+          peer.isConnected = true
           meshLog(
             tag = "gattClient",
             message = "Connected to peer",
@@ -440,6 +546,7 @@ class BleBroadcastModule : Module() {
       }
 
       peer.meshCharacteristic = characteristic
+      peer.helloCharacteristic = meshService.getCharacteristic(helloCharacteristicUuid)
       // The advertisement may lack the peer's mesh ID (iPhones): read it before the link is ready,
       // so a second link to a device this phone already reaches is closed right away.
       val reading = gatt.readCharacteristic(characteristic)
@@ -450,7 +557,7 @@ class BleBroadcastModule : Module() {
           detail = mapOf("deviceId" to gatt.device.address, "advertisedMeshId" to peer.meshId),
           level = "warn",
         )
-        requestLinkMtu(gatt)
+        introduceToPeer(gatt)
       }
     }
 
@@ -493,7 +600,7 @@ class BleBroadcastModule : Module() {
           ),
           level = "warn",
         )
-        requestLinkMtu(gatt)
+        introduceToPeer(gatt)
         return
       }
 
@@ -507,7 +614,134 @@ class BleBroadcastModule : Module() {
         return
       }
 
+      introduceToPeer(gatt)
+    }
+
+    /**
+     * Writes this device's mesh ID to the peer's hello characteristic, then subscribes to the peer's
+     * notifications: the peer then knows who subscribed and can send over this link when its own
+     * link to this device is not up. Each step that fails moves on: the link works without them.
+     */
+    private fun introduceToPeer(gatt: BluetoothGatt) {
+      val peer = meshPeers[gatt.device.address] ?: return
+      if (peer.gatt !== gatt || peer.isReady) {
+        return
+      }
+
+      val helloCharacteristic = peer.helloCharacteristic
+      val helloBytes = localMeshId?.let(::hexToBytes)
+      if (helloCharacteristic != null && helloBytes != null) {
+        helloCharacteristic.value = helloBytes
+        helloCharacteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        if (gatt.writeCharacteristic(helloCharacteristic)) {
+          return // Continues in onCharacteristicWrite.
+        }
+        meshLog(
+          tag = "gattClient",
+          message = "Could not start the hello write",
+          detail = mapOf("deviceId" to gatt.device.address),
+          level = "warn",
+        )
+      }
+      subscribeToPeer(gatt)
+    }
+
+    private fun subscribeToPeer(gatt: BluetoothGatt) {
+      val peer = meshPeers[gatt.device.address] ?: return
+      if (peer.gatt !== gatt || peer.isReady) {
+        return
+      }
+
+      val characteristic = peer.meshCharacteristic
+      val clientConfig = characteristic?.getDescriptor(clientConfigDescriptorUuid)
+      if (characteristic == null || clientConfig == null ||
+        !gatt.setCharacteristicNotification(characteristic, true)
+      ) {
+        meshLog(
+          tag = "gattClient",
+          message = "Peer does not offer notifications",
+          detail = mapOf("deviceId" to gatt.device.address),
+          level = "warn",
+        )
+        requestLinkMtu(gatt)
+        return
+      }
+
+      clientConfig.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+      if (!gatt.writeDescriptor(clientConfig)) {
+        meshLog(
+          tag = "gattClient",
+          message = "Could not start subscribing to the peer",
+          detail = mapOf("deviceId" to gatt.device.address),
+          level = "warn",
+        )
+        requestLinkMtu(gatt)
+      }
+      // Continues in onDescriptorWrite.
+    }
+
+    override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+      if (descriptor.uuid != clientConfigDescriptorUuid) {
+        return
+      }
+      meshLog(
+        tag = "gattClient",
+        message = if (status == BluetoothGatt.GATT_SUCCESS) {
+          "Subscribed to the peer's notifications"
+        } else {
+          "Subscribing to the peer's notifications failed"
+        },
+        detail = mapOf("deviceId" to gatt.device.address, "status" to status),
+        level = if (status == BluetoothGatt.GATT_SUCCESS) "info" else "warn",
+      )
       requestLinkMtu(gatt)
+    }
+
+    override fun onCharacteristicChanged(
+      gatt: BluetoothGatt,
+      characteristic: BluetoothGattCharacteristic,
+      value: ByteArray,
+    ) {
+      handlePeerNotification(gatt, characteristic, value)
+    }
+
+    // Android 12 and lower only: Android 13 calls the overload above instead. The characteristic's
+    // value is overwritten by the next notification, so it is copied right here.
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+      handlePeerNotification(gatt, characteristic, characteristic.value?.copyOf() ?: ByteArray(0))
+    }
+
+    /** A packet the peer sent as a notification, over this device's link to it. */
+    private fun handlePeerNotification(
+      gatt: BluetoothGatt,
+      characteristic: BluetoothGattCharacteristic,
+      value: ByteArray,
+    ) {
+      if (characteristic.uuid != characteristicUuid || value.isEmpty()) {
+        return
+      }
+      val deviceId = gatt.device.address
+      mainHandler.post {
+        val peer = meshPeers[deviceId]
+        val jsonMessage = Base64.encodeToString(value, Base64.NO_WRAP)
+        meshLog(
+          tag = "gattClient",
+          message = "Received notification",
+          detail = mapOf(
+            "deviceId" to deviceId,
+            "payloadBytes" to value.size,
+            "wireChars" to jsonMessage.length,
+          ),
+        )
+        emitMessage(
+          linkDeviceId = deviceId,
+          deviceName = peer?.deviceName,
+          rssi = peer?.rssi ?: 0,
+          jsonMessage = jsonMessage,
+          source = "connection",
+        )
+      }
     }
 
     /**
@@ -551,7 +785,7 @@ class BleBroadcastModule : Module() {
           "serverMtu" to serverMtuByDeviceId[gatt.device.address],
         ),
       )
-      emitPeerConnected(peer.deviceId, peer.meshId, peer.deviceName, peer.rssi)
+      emitPeerConnected(peer.deviceId, peer.meshId, peer.deviceName, peer.rssi, LINK_OUTBOUND)
     }
 
     override fun onCharacteristicWrite(
@@ -559,6 +793,20 @@ class BleBroadcastModule : Module() {
       characteristic: BluetoothGattCharacteristic,
       status: Int,
     ) {
+      // The hello is not part of a send: it only moves link setup on.
+      if (characteristic.uuid == helloCharacteristicUuid) {
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+          meshLog(
+            tag = "gattClient",
+            message = "Hello write failed",
+            detail = mapOf("deviceId" to gatt.device.address, "status" to status),
+            level = "warn",
+          )
+        }
+        subscribeToPeer(gatt)
+        return
+      }
+
       val peer = meshPeers[gatt.device.address]
       if (status != BluetoothGatt.GATT_SUCCESS) {
         val failures = (peer?.consecutiveWriteFailures ?: 0) + 1
@@ -707,7 +955,7 @@ class BleBroadcastModule : Module() {
     }.runOnQueue(Queues.MAIN)
 
     AsyncFunction("getConnectedPeerCountAsync") {
-      meshPeers.values.count { peer -> peer.isReady }
+      peerRoutes().size
     }.runOnQueue(Queues.MAIN)
 
     // Synced items: one append-only file of JSON lines per sync scope (`fileKey` is hex from JS).
@@ -940,8 +1188,10 @@ class BleBroadcastModule : Module() {
   }
 
   private fun resetMeshRuntime(bluetoothState: String) {
-    val hadRuntime = isAdvertising || isScanning || gattServer != null || meshPeers.isNotEmpty() || activeSendOperation != null
+    val hadRuntime = isAdvertising || isScanning || gattServer != null || meshPeers.isNotEmpty() ||
+      inboundLinks.isNotEmpty() || activeSendOperation != null
     val droppedPeerCount = meshPeers.size
+    val droppedInboundCount = inboundLinks.size
 
     // The adapter may already be off: these throw IllegalStateException in that case.
     if (isAdvertising || pendingStartPromise != null) {
@@ -955,6 +1205,7 @@ class BleBroadcastModule : Module() {
     runCatching { gattServer?.close() }
     gattServer = null
     payloadCharacteristic = null
+    dropInboundLinks()
 
     val unavailableError = bluetoothUnavailableException(bluetoothState)
     pendingStartPromise?.reject(unavailableError.code, unavailableError.message, unavailableError)
@@ -968,13 +1219,18 @@ class BleBroadcastModule : Module() {
     preparedWriteBuffers.clear()
     lastConnectionAttemptByDevice.clear()
     meshIdByDeviceId.clear()
+    scanRssiByMeshId.clear()
     lastEmittedJsonByLink.clear()
 
     if (hadRuntime) {
       meshLog(
         tag = "bluetooth",
         message = "Bluetooth unavailable — mesh runtime reset",
-        detail = mapOf("state" to bluetoothState, "droppedPeerCount" to droppedPeerCount),
+        detail = mapOf(
+          "state" to bluetoothState,
+          "droppedPeerCount" to droppedPeerCount,
+          "droppedInboundCount" to droppedInboundCount,
+        ),
         level = "warn",
       )
     }
@@ -1024,13 +1280,15 @@ class BleBroadcastModule : Module() {
     runCatching { gattServer?.close() }
     gattServer = null
     payloadCharacteristic = null
+    dropInboundLinks()
     pendingStartPromise?.reject("ERR_BLE_STOPPED", "Mesh peripheral stopped", null)
     pendingStartPromise = null
   }
 
   /**
-   * Writes to every ready link except [excludeDeviceId], or only to the link whose advertised mesh
-   * ID is [targetDeviceId] when it is set.
+   * Sends to every reachable peer once, except the peer behind the link [excludeDeviceId], or only
+   * to the peer whose mesh ID is [targetDeviceId] when it is set. A peer gets a write over this
+   * device's link to it, or a notification when only its link to this device is up.
    */
   private fun sendPacket(jsonMessage: String, excludeDeviceId: String?, targetDeviceId: String?, promise: Promise) {
     try {
@@ -1052,38 +1310,46 @@ class BleBroadcastModule : Module() {
       validatePayloadSize(payload)
 
       val peerTransfers = mutableListOf<OutboundPeerTransfer>()
-      var readyPeerCount = 0
-      var skippedNotReady = 0
+      var notifiedCount = 0
+      val skippedNotReady = meshPeers.values.count { peer -> !peer.isReady }
       var skippedExcluded = 0
-      var writeQueueFailures = 0
+      var skippedTooLarge = 0
+      val routes = peerRoutes()
+      // The link a relayed packet came in on, and every other link to the same peer.
+      val excludedMeshId = excludeDeviceId?.let { linkId ->
+        meshPeers[linkId]?.meshId ?: inboundLinks[linkId]?.meshId
+      }
 
-      for (peer in meshPeers.values) {
-        if (!peer.isReady) {
-          skippedNotReady += 1
-          continue
-        }
-
-        readyPeerCount += 1
-
-        if (peer.deviceId == excludeDeviceId) {
+      for (route in routes) {
+        if (excludeDeviceId != null &&
+          (excludeDeviceId in route.linkIds || (excludedMeshId != null && route.meshId == excludedMeshId))
+        ) {
           skippedExcluded += 1
           continue
         }
 
-        if (targetDeviceId != null && peer.meshId != targetDeviceId.lowercase()) {
+        if (targetDeviceId != null && route.meshId != targetDeviceId.lowercase()) {
           continue
         }
 
-        val characteristic = peer.meshCharacteristic
-        if (characteristic == null) {
-          writeQueueFailures += 1
-          continue
+        val outboundPeer = route.outbound
+        val inboundLink = route.inbound
+        if (outboundPeer != null) {
+          peerTransfers.add(OutboundPeerTransfer(peer = outboundPeer, payload = payload))
+        } else if (inboundLink != null) {
+          // A notification is one ATT packet: no long-write equivalent.
+          val mtu = serverMtuByDeviceId[inboundLink.deviceId] ?: DEFAULT_ATT_MTU
+          if (payload.size > mtu - ATT_HEADER_BYTES) {
+            skippedTooLarge += 1
+            continue
+          }
+          enqueueNotification(inboundLink.deviceId, payload)
+          notifiedCount += 1
         }
-
-        peerTransfers.add(OutboundPeerTransfer(peer = peer, payload = payload))
       }
 
-      val sentCount = peerTransfers.size
+      val sentCount = peerTransfers.size + notifiedCount
+      val readyPeerCount = routes.size
 
       meshLog(
         tag = "sendPacket",
@@ -1094,14 +1360,17 @@ class BleBroadcastModule : Module() {
           "excludeDeviceId" to excludeDeviceId,
           "targetDeviceId" to targetDeviceId,
           "sentCount" to sentCount,
+          "notifiedCount" to notifiedCount,
           "readyPeerCount" to readyPeerCount,
           "skippedNotReady" to skippedNotReady,
           "skippedExcluded" to skippedExcluded,
-          "writeQueueFailures" to writeQueueFailures,
+          "skippedTooLarge" to skippedTooLarge,
         ),
       )
 
-      if (sentCount == 0) {
+      sendPendingNotifications()
+
+      if (peerTransfers.isEmpty()) {
         promise.resolve(
           mapOf(
             "sentCount" to sentCount,
@@ -1123,6 +1392,211 @@ class BleBroadcastModule : Module() {
       )
     } catch (error: CodedException) {
       promise.reject(error.code, error.message, error)
+    }
+  }
+
+  /** Every peer this device can send to, once each: a peer linked both ways is one route. */
+  private fun peerRoutes(): List<PeerRoute> {
+    val routes = mutableMapOf<String, PeerRoute>()
+
+    for (peer in meshPeers.values) {
+      if (!peer.isReady || peer.meshCharacteristic == null) {
+        continue
+      }
+      val route = routes.getOrPut(peer.meshId ?: "link:${peer.deviceId}") { PeerRoute(peer.meshId) }
+      if (route.outbound == null) {
+        route.outbound = peer
+      }
+      route.linkIds.add(peer.deviceId)
+    }
+
+    for (link in inboundLinks.values) {
+      val route = routes.getOrPut(link.meshId ?: "link:${link.deviceId}") { PeerRoute(link.meshId) }
+      if (route.inbound == null) {
+        route.inbound = link
+      }
+      route.linkIds.add(link.deviceId)
+    }
+
+    return routes.values.toList()
+  }
+
+  private fun enqueueNotification(deviceId: String, payload: ByteArray) {
+    pendingNotifications.addLast(PendingNotification(deviceId, payload))
+    if (pendingNotifications.size > MAX_PENDING_NOTIFICATIONS) {
+      val dropped = pendingNotifications.removeFirst()
+      meshLog(
+        tag = "gattServer",
+        message = "Notification queue full: dropped the oldest",
+        detail = mapOf("deviceId" to dropped.deviceId, "payloadBytes" to dropped.payload.size),
+        level = "warn",
+      )
+    }
+  }
+
+  /** Sends the next queued notification; the one after waits for its `onNotificationSent`. */
+  private fun sendPendingNotifications() {
+    if (notificationInFlight != null) {
+      return
+    }
+    val server = gattServer
+    val characteristic = payloadCharacteristic
+    if (server == null || characteristic == null) {
+      pendingNotifications.clear()
+      return
+    }
+
+    while (true) {
+      val notification = pendingNotifications.removeFirstOrNull() ?: return
+      val link = inboundLinks[notification.deviceId] ?: continue
+      if (notifyCentral(server, characteristic, link.device, notification.payload)) {
+        notificationInFlight = link.deviceId
+        meshLog(
+          tag = "gattServer",
+          message = "Sent notification",
+          detail = mapOf(
+            "deviceId" to link.deviceId,
+            "meshId" to link.meshId,
+            "payloadBytes" to notification.payload.size,
+          ),
+        )
+        watchNotificationSent(link.deviceId)
+        return
+      }
+      meshLog(
+        tag = "gattServer",
+        message = "Notification refused",
+        detail = mapOf("deviceId" to link.deviceId, "payloadBytes" to notification.payload.size),
+        level = "warn",
+      )
+    }
+  }
+
+  @Suppress("DEPRECATION")
+  private fun notifyCentral(
+    server: BluetoothGattServer,
+    characteristic: BluetoothGattCharacteristic,
+    device: BluetoothDevice,
+    payload: ByteArray,
+  ): Boolean =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      server.notifyCharacteristicChanged(device, characteristic, false, payload) == BluetoothStatusCodes.SUCCESS
+    } else {
+      characteristic.value = payload
+      server.notifyCharacteristicChanged(device, characteristic, false)
+    }
+
+  private fun handleNotificationSent(deviceId: String, status: Int) {
+    if (notificationInFlight != deviceId) {
+      return
+    }
+    notificationInFlight = null
+    if (status != BluetoothGatt.GATT_SUCCESS) {
+      meshLog(
+        tag = "gattServer",
+        message = "Notification failed",
+        detail = mapOf("deviceId" to deviceId, "status" to status),
+        level = "warn",
+      )
+    }
+    sendPendingNotifications()
+  }
+
+  /** A notification never confirmed (the link died mid-send) would hold every later one. */
+  private fun watchNotificationSent(deviceId: String) {
+    notificationSerial += 1
+    val serial = notificationSerial
+    mainHandler.postDelayed({
+      if (notificationSerial != serial || notificationInFlight != deviceId) {
+        return@postDelayed
+      }
+      meshLog(
+        tag = "gattServer",
+        message = "Notification never confirmed",
+        detail = mapOf("deviceId" to deviceId, "timeoutMs" to NOTIFICATION_SENT_TIMEOUT_MS),
+        level = "warn",
+      )
+      notificationInFlight = null
+      sendPendingNotifications()
+    }, NOTIFICATION_SENT_TIMEOUT_MS)
+  }
+
+  /**
+   * A central wrote its mesh ID before subscribing. When the subscription came first, the link is
+   * reported again now that its peer is known.
+   */
+  private fun handleHello(device: BluetoothDevice, value: ByteArray) {
+    if (value.isEmpty()) {
+      return
+    }
+    val meshId = bytesToHex(value)
+    helloMeshIdByDeviceId[device.address] = meshId
+    val link = inboundLinks[device.address]
+    meshLog(
+      tag = "gattServer",
+      message = "Central introduced itself",
+      detail = mapOf("deviceId" to device.address, "meshId" to meshId, "isSubscribed" to (link != null)),
+    )
+    if (link == null || link.meshId == meshId) {
+      return
+    }
+    link.meshId = meshId
+    emitInboundLinkConnected(link)
+  }
+
+  private fun addInboundLink(device: BluetoothDevice) {
+    if (inboundLinks.containsKey(device.address)) {
+      return
+    }
+    val link = InboundLink(device.address, device, helloMeshIdByDeviceId[device.address])
+    inboundLinks[device.address] = link
+    meshLog(
+      tag = "gattServer",
+      message = "Central subscribed to notifications",
+      detail = mapOf(
+        "deviceId" to device.address,
+        "meshId" to link.meshId,
+        "mtu" to serverMtuByDeviceId[device.address],
+      ),
+    )
+    emitInboundLinkConnected(link)
+  }
+
+  private fun removeInboundLink(deviceId: String, reason: String) {
+    val link = inboundLinks.remove(deviceId) ?: return
+    pendingNotifications.removeAll { notification -> notification.deviceId == deviceId }
+    meshLog(
+      tag = "gattServer",
+      message = reason,
+      detail = mapOf("deviceId" to deviceId, "meshId" to link.meshId),
+      level = "warn",
+    )
+    emitPeerDisconnected(deviceId, link.meshId, LINK_INBOUND)
+    if (notificationInFlight == deviceId) {
+      notificationInFlight = null
+      sendPendingNotifications()
+    }
+  }
+
+  private fun emitInboundLinkConnected(link: InboundLink) {
+    emitPeerConnected(
+      link.deviceId,
+      link.meshId,
+      deviceName = null,
+      rssi = link.meshId?.let { meshId -> scanRssiByMeshId[meshId] },
+      direction = LINK_INBOUND,
+    )
+  }
+
+  /** Subscriptions end with the GATT server (mesh stop or restart, Bluetooth off). */
+  private fun dropInboundLinks() {
+    val droppedLinks = inboundLinks.values.toList()
+    inboundLinks.clear()
+    helloMeshIdByDeviceId.clear()
+    pendingNotifications.clear()
+    notificationInFlight = null
+    for (link in droppedLinks) {
+      emitPeerDisconnected(link.deviceId, link.meshId, LINK_INBOUND)
     }
   }
 
@@ -1422,7 +1896,11 @@ class BleBroadcastModule : Module() {
       return
     }
 
-    scheduleMeshConnection(result, meshIdFromScanRecord(record) ?: meshIdByDeviceId[result.device.address])
+    val meshId = meshIdFromScanRecord(record) ?: meshIdByDeviceId[result.device.address]
+    if (meshId != null) {
+      scanRssiByMeshId[meshId] = result.rssi
+    }
+    scheduleMeshConnection(result, meshId)
   }
 
   private fun scheduleMeshConnection(result: ScanResult, meshId: String?) {
@@ -1444,7 +1922,7 @@ class BleBroadcastModule : Module() {
       if (existingPeer.meshId == null && meshId != null) {
         existingPeer.meshId = meshId
         if (existingPeer.isReady) {
-          emitPeerConnected(existingPeer.deviceId, meshId, existingPeer.deviceName, existingPeer.rssi)
+          emitPeerConnected(existingPeer.deviceId, meshId, existingPeer.deviceName, existingPeer.rssi, LINK_OUTBOUND)
         }
       }
       return
@@ -1455,16 +1933,30 @@ class BleBroadcastModule : Module() {
     }
 
     // Addresses rotate, so one device can show up under several addresses. One link per device is
-    // enough; the duplicate would only waste one of the peer slots.
-    if (meshId != null && meshPeers.values.any { peer -> peer.meshId == meshId }) {
-      return
+    // enough; the duplicate would only waste one of the peer slots. A link still setting up gives
+    // way to the new address: a connect to an address the peer no longer uses never completes.
+    val now = System.currentTimeMillis()
+    val linkedPeer = meshId?.let { id -> meshPeers.values.firstOrNull { peer -> peer.meshId == id } }
+    if (linkedPeer != null) {
+      if (linkedPeer.isReady || now - linkedPeer.scheduledAt < LINK_REPLACE_GRACE_MS) {
+        return
+      }
+      dropMeshPeer(
+        linkedPeer.deviceId,
+        "The peer advertises under a new address",
+        mapOf(
+          "meshId" to meshId,
+          "newDeviceId" to deviceId,
+          "isConnected" to linkedPeer.isConnected,
+          "pendingMs" to (now - linkedPeer.scheduledAt),
+        ),
+      )
     }
 
     if (meshPeers.size >= MAX_MESH_PEERS) {
       return
     }
 
-    val now = System.currentTimeMillis()
     val lastAttempt = lastConnectionAttemptByDevice[deviceId] ?: 0L
     if (now - lastAttempt < CONNECTION_RETRY_INTERVAL_MS) {
       return
@@ -1499,6 +1991,22 @@ class BleBroadcastModule : Module() {
         "rssi" to result.rssi,
       ),
     )
+    watchConnection(gattClient)
+  }
+
+  /**
+   * Drops a connection attempt still not connected after `CONNECT_TIMEOUT_MS`, so the next
+   * advertisement retries it (the stack's own timeout is ~30 s). `watchLinkSetup` takes over once
+   * connected.
+   */
+  private fun watchConnection(gatt: BluetoothGatt) {
+    mainHandler.postDelayed({
+      val peer = meshPeers[gatt.device.address] ?: return@postDelayed
+      if (peer.gatt !== gatt || peer.isConnected) {
+        return@postDelayed
+      }
+      dropMeshPeer(peer.deviceId, "Not connected in time", mapOf("timeoutMs" to CONNECT_TIMEOUT_MS))
+    }, CONNECT_TIMEOUT_MS)
   }
 
   /**
@@ -1633,8 +2141,9 @@ class BleBroadcastModule : Module() {
     pendingConnectionDeviceIds.remove(deviceId)
     preparedWriteBuffers.remove(deviceId)
     peer.gatt.close()
-    if (emitDisconnect) {
-      emitPeerDisconnected(deviceId, peer.meshId)
+    // A link that is not ready was never reported.
+    if (emitDisconnect && peer.isReady) {
+      emitPeerDisconnected(deviceId, peer.meshId, LINK_OUTBOUND)
     }
   }
 
@@ -1645,7 +2154,14 @@ class BleBroadcastModule : Module() {
     pendingConnectionDeviceIds.clear()
   }
 
-  private fun emitPeerConnected(deviceId: String, meshId: String?, deviceName: String?, rssi: Int) {
+  /** [direction] is `outbound` for a link this device opened, `inbound` for a peer's subscription. */
+  private fun emitPeerConnected(
+    deviceId: String,
+    meshId: String?,
+    deviceName: String?,
+    rssi: Int?,
+    direction: String,
+  ) {
     sendEvent(
       "onPeerConnected",
       mapOf(
@@ -1653,16 +2169,18 @@ class BleBroadcastModule : Module() {
         "meshId" to meshId,
         "deviceName" to deviceName,
         "rssi" to rssi,
+        "direction" to direction,
       ),
     )
   }
 
-  private fun emitPeerDisconnected(deviceId: String, meshId: String?) {
+  private fun emitPeerDisconnected(deviceId: String, meshId: String?, direction: String) {
     sendEvent(
       "onPeerDisconnected",
       mapOf(
         "deviceId" to deviceId,
         "meshId" to meshId,
+        "direction" to direction,
       ),
     )
   }
@@ -1749,7 +2267,9 @@ class BleBroadcastModule : Module() {
   }
 
   private fun setupGattServer() {
+    // Closing the server ends every subscription to it.
     gattServer?.close()
+    dropInboundLinks()
 
     val manager = bluetoothManager ?: throw CodedException(
       code = "ERR_BLE_MANAGER",
@@ -1762,15 +2282,29 @@ class BleBroadcastModule : Module() {
       characteristicUuid,
       BluetoothGattCharacteristic.PROPERTY_READ or
         BluetoothGattCharacteristic.PROPERTY_WRITE or
-        BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+        BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE or
+        BluetoothGattCharacteristic.PROPERTY_NOTIFY,
       BluetoothGattCharacteristic.PERMISSION_READ or
         BluetoothGattCharacteristic.PERMISSION_WRITE,
     )
     characteristic.value = ByteArray(0)
+    characteristic.addDescriptor(
+      BluetoothGattDescriptor(
+        clientConfigDescriptorUuid,
+        BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE,
+      ),
+    )
     payloadCharacteristic = characteristic
+
+    val helloCharacteristic = BluetoothGattCharacteristic(
+      helloCharacteristicUuid,
+      BluetoothGattCharacteristic.PROPERTY_WRITE,
+      BluetoothGattCharacteristic.PERMISSION_WRITE,
+    )
 
     val service = BluetoothGattService(serviceUuid, BluetoothGattService.SERVICE_TYPE_PRIMARY)
     service.addCharacteristic(characteristic)
+    service.addCharacteristic(helloCharacteristic)
 
     val added = gattServer?.addService(service) ?: false
     if (!added) {
@@ -1849,6 +2383,11 @@ class BleBroadcastModule : Module() {
   companion object {
     private const val SERVICE_UUID = "0000feed-0000-1000-8000-00805f9b34fb"
     private const val CHARACTERISTIC_UUID = "0000beef-0000-1000-8000-00805f9b34fb"
+    private const val HELLO_CHARACTERISTIC_UUID = "0000bef0-0000-1000-8000-00805f9b34fb"
+    /** Client Characteristic Configuration: a central writes it to subscribe to notifications. */
+    private const val CLIENT_CONFIG_DESCRIPTOR_UUID = "00002902-0000-1000-8000-00805f9b34fb"
+    private const val LINK_OUTBOUND = "outbound"
+    private const val LINK_INBOUND = "inbound"
     private const val MAX_GATT_PAYLOAD_BYTES = 4096
     /** ATT payload limit after MTU 517 negotiation (517 − 3 byte header). */
     private const val MAX_ATT_WRITE_BYTES = 512
@@ -1858,6 +2397,14 @@ class BleBroadcastModule : Module() {
     private const val DISCOVERY_ANSWER_TIMEOUT_MS = 3_000L
     private const val MAX_DISCOVERY_ATTEMPTS = 4
     private const val LINK_SETUP_TIMEOUT_MS = 15_000L
+    /** Connections normally take under 4 s; the stack's own timeout is ~30 s. */
+    private const val CONNECT_TIMEOUT_MS = 10_000L
+    /** A link still setting up this long gives way to the same peer seen under a new address. */
+    private const val LINK_REPLACE_GRACE_MS = 5_000L
+    private const val DEFAULT_ATT_MTU = 23
+    private const val ATT_HEADER_BYTES = 3
+    private const val MAX_PENDING_NOTIFICATIONS = 64
+    private const val NOTIFICATION_SENT_TIMEOUT_MS = 2_000L
     private const val MAX_CONSECUTIVE_WRITE_FAILURES = 3
     /** ATT "Invalid Handle": the characteristic is not where the cached GATT table says. */
     private const val ATT_INVALID_HANDLE = 1

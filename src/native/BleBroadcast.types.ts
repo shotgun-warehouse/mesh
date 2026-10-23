@@ -17,21 +17,36 @@ export type ReceivedMessage = {
   timestamp: number;
 };
 
+/**
+ * `outbound`: this device connected to the peer and writes to it. `inbound`: the peer connected to
+ * this device and subscribed to its notifications, so this device can send to it even before (or
+ * without) its own link to the peer. A peer is usually linked both ways; it is sent each packet
+ * once.
+ */
+export type LinkDirection = "outbound" | "inbound";
+
 export type PeerConnectionEvent = {
-  /** BLE link identifier (not stable: one phone can appear under several). */
+  /**
+   * BLE link identifier (not stable: one phone can appear under several). Unique per direction
+   * only: an outbound and an inbound link can share it.
+   */
   deviceId: string;
   /**
-   * The peer's mesh device ID: from its advertisement, or read from the peer before the link is
-   * ready (Android). Null when neither gave it.
+   * The peer's mesh device ID: from its advertisement or read from the peer before the link is
+   * ready (outbound), or from the hello the peer writes before subscribing (inbound). Null when
+   * none gave it; the event comes again once it is known.
    */
   meshId: string | null;
   deviceName: string | null;
-  rssi: number;
+  /** From the link's advertisement (outbound), else the last advertisement seen for `meshId`. */
+  rssi: number | null;
+  direction: LinkDirection;
 };
 
 export type PeerDisconnectionEvent = {
   deviceId: string;
   meshId: string | null;
+  direction: LinkDirection;
 };
 
 export type SendPacketResult = {

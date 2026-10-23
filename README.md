@@ -156,7 +156,7 @@ Nearby devices see this device under its display name, which defaults to the dev
 | `publishItem(data)`      | See [Publishing](#publishing). Rejects when `syncScope` is `null`.                                                       |
 | `addItems(scope, items)` | Seeds the set with items from your server. See [Seeding](#seeding-from-your-server).                                     |
 | `peers`                  | Devices on the mesh, most recently active first: `{ id, displayName, deviceName, rssi, lastSeen }`. See [Peers](#peers). |
-| `connectedPeerCount`     | Number of direct Bluetooth links.                                                                                        |
+| `connectedPeerCount`     | Number of peers with a direct Bluetooth link, in either direction.                                                       |
 | `getPeer(peerId)`        | A peer by its device ID.                                                                                                 |
 | `deviceId`               | This device's ID: 8 hex chars, derived from `deviceKey` or generated once per install. Peers see it as `peer.id`.        |
 | `displayName`            | This device's display name.                                                                                              |

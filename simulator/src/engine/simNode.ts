@@ -258,12 +258,8 @@ export class SimNode implements MediumDevice {
       this.label,
       {
         onIdentity: () => {},
-        onLinkConnected: (event) => {
-          if (event.deviceId) this.itemSync.neighbourUp(event.deviceId);
-        },
-        onLinkDisconnected: (event) => {
-          if (event.deviceId) this.itemSync.neighbourDown(event.deviceId);
-        },
+        onNeighbourUp: (deviceId) => this.itemSync.neighbourUp(deviceId),
+        onNeighbourDown: (deviceId) => this.itemSync.neighbourDown(deviceId),
         onPeerCountChange: (connectedPeerCount) => {
           this.peerCount = connectedPeerCount;
         },

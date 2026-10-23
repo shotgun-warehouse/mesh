@@ -3,9 +3,19 @@ import { Alert, StyleSheet, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { MeshProvider, useMesh, type MeshItem } from "@shotgunlive/mesh";
 
+import {
+  addImageChunk,
+  buildImageChunks,
+  parseImageChunk,
+  type EncodedImage,
+} from "./src/images";
 import { ChatScreen } from "./src/screens/ChatScreen";
 import { HomeScreen } from "./src/screens/HomeScreen";
-import type { ChatMessage, ChatWireMessage } from "./src/types";
+import type {
+  ChatMessage,
+  ChatWireMessage,
+  ImageChunkWireMessage,
+} from "./src/types";
 
 /** Every device running the example chats in one set. */
 const CHAT_SYNC_SCOPE = "chat";
@@ -16,29 +26,76 @@ function parseChatWireMessage(json: string): ChatWireMessage | null {
     if (parsed.type === "chat" && typeof parsed.text === "string") {
       return { type: "chat", text: parsed.text };
     }
+    if (parsed.type === "image") {
+      return parseImageChunk(parsed as Partial<ImageChunkWireMessage>);
+    }
   } catch {
     return null;
   }
   return null;
 }
 
-/** Chat messages are synced items: a device that joins later still gets the conversation. */
-function toChatMessages(items: MeshItem[], outgoing: boolean): ChatMessage[] {
-  return items.flatMap((item) => {
+/**
+ * Chat messages are synced items: a device that joins later still gets the conversation. A photo
+ * is one item per chunk, gathered into one message as its chunks arrive (in any order).
+ */
+function applyItems(
+  previousMessages: ChatMessage[],
+  items: MeshItem[],
+  outgoing: boolean,
+): ChatMessage[] {
+  const receivedAt = Date.now();
+  let messages = previousMessages;
+
+  for (const item of items) {
     const wireMessage = parseChatWireMessage(item.data);
     if (!wireMessage) {
-      return [];
+      continue;
     }
-    return [
-      {
-        id: `${item.author}:${item.seq}`,
-        text: wireMessage.text,
-        timestamp: item.createdAt,
-        outgoing,
-        senderId: item.author,
-      },
-    ];
-  });
+
+    if (wireMessage.type === "chat") {
+      messages = [
+        ...messages,
+        {
+          kind: "text",
+          id: `${item.author}:${item.seq}`,
+          text: wireMessage.text,
+          timestamp: item.createdAt,
+          outgoing,
+          senderId: item.author,
+        },
+      ];
+      continue;
+    }
+
+    const id = `${item.author}:image:${wireMessage.imageId}`;
+    const existingIndex = messages.findIndex((message) => message.id === id);
+    const existing = existingIndex === -1 ? undefined : messages[existingIndex];
+    const image = addImageChunk(
+      existing?.kind === "image" ? existing.image : undefined,
+      wireMessage,
+      receivedAt,
+    );
+    const message: ChatMessage = {
+      kind: "image",
+      id,
+      image,
+      timestamp: Math.min(
+        existing?.timestamp ?? item.createdAt,
+        item.createdAt,
+      ),
+      outgoing,
+      senderId: item.author,
+    };
+    messages =
+      existingIndex === -1
+        ? [...messages, message]
+        : messages.map((previous, index) =>
+            index === existingIndex ? message : previous,
+          );
+  }
+
+  return messages;
 }
 
 type MeshChatAppProps = {
@@ -77,7 +134,7 @@ function MeshChatApp({ messages, onPublished }: MeshChatAppProps) {
       const existingPreview = previewBySenderId.get(message.senderId);
       if (!existingPreview || message.timestamp > existingPreview.timestamp) {
         previewBySenderId.set(message.senderId, {
-          text: message.text,
+          text: message.kind === "text" ? message.text : "📷 Photo",
           timestamp: message.timestamp,
         });
       }
@@ -104,6 +161,17 @@ function MeshChatApp({ messages, onPublished }: MeshChatAppProps) {
     }
   };
 
+  /** One item per chunk, published in order; the bubble fills in as each one is out. */
+  const handleSendImage = async (image: EncodedImage) => {
+    try {
+      for (const chunk of buildImageChunks(image)) {
+        onPublished(await publishItem(JSON.stringify(chunk)));
+      }
+    } catch (sendError) {
+      Alert.alert("Photo not fully sent", String(sendError));
+    }
+  };
+
   return (
     <View style={styles.container}>
       {activePeer ? (
@@ -112,6 +180,7 @@ function MeshChatApp({ messages, onPublished }: MeshChatAppProps) {
           messages={peerMessages}
           onBack={() => setActivePeerId(null)}
           onSendMessage={handleSendMessage}
+          onSendImage={handleSendImage}
         />
       ) : (
         <HomeScreen
@@ -130,10 +199,9 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
 
   const appendItems = (items: MeshItem[], outgoing: boolean) => {
-    setMessages((previousMessages) => [
-      ...previousMessages,
-      ...toChatMessages(items, outgoing),
-    ]);
+    setMessages((previousMessages) =>
+      applyItems(previousMessages, items, outgoing),
+    );
   };
 
   return (
