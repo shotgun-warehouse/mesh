@@ -8,6 +8,9 @@ import type { ImageChunkWireMessage, ImageTransfer } from "./types";
  */
 const CHUNK_CHARS = 3800;
 
+/** Largest chunk count accepted from a peer (~3.7 MB of base64); L photos take ~30. */
+const MAX_CHUNK_COUNT = 1000;
+
 export type ImagePreset = {
   key: "small" | "medium" | "large";
   label: string;
@@ -112,9 +115,13 @@ export function parseImageChunk(
   if (
     parsed.type !== "image" ||
     typeof parsed.imageId !== "string" ||
-    typeof parsed.index !== "number" ||
-    typeof parsed.count !== "number" ||
+    !Number.isInteger(parsed.index) ||
+    !Number.isInteger(parsed.count) ||
     typeof parsed.data !== "string" ||
+    parsed.index === undefined ||
+    parsed.count === undefined ||
+    parsed.count < 1 ||
+    parsed.count > MAX_CHUNK_COUNT ||
     parsed.index < 0 ||
     parsed.index >= parsed.count
   ) {
