@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+Android asks for the Bluetooth permissions again when its first request showed no dialog. JS-only change.
+
+- **Android:** a permission request that showed no dialog no longer counts as asked. Android drops a request made while another app permission dialog is on screen (e.g. Stripe Terminal asking at launch), so the mesh never asked again until the next app launch; the foreground refresh after that dialog closes now asks again.
+
 ## 0.4.0
 
 A phone can send to a peer as soon as either of them has connected to the other, and a connection that never completes no longer blocks a peer for minutes. Seen in the field: an iPhone's connection to an Android phone that had rotated its Bluetooth address stayed pending, so the iPhone sent nothing to it and the Android listed the iPhone under its short ID. Native and wire change (new GATT characteristic): needs a new development build on every device.

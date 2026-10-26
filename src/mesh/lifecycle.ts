@@ -68,8 +68,10 @@ let mountedLifecycleCount = 0;
 /** Started, not yet disposed: `clearMeshItems` empties their sets in memory too. */
 const liveLifecycles = new Set<MeshLifecycle>();
 // Android shows the permission dialog once per app launch. After a denial the user grants it in
-// Settings; the foreground refresh picks that up.
-let hasRequestedAndroidPermissions = false;
+// Settings; the foreground refresh picks that up. A request that showed no dialog does not count:
+// Android drops one made while another app permission dialog is on screen (e.g. Stripe Terminal
+// asking at launch), and the foreground refresh after that dialog closes asks again.
+let hasAskedAndroidPermissions = false;
 
 function enqueueNativeOperation(operation: () => Promise<void>): void {
   nativeOperationQueue = nativeOperationQueue
@@ -248,11 +250,14 @@ export class MeshLifecycle {
       if (
         bluetoothState === "unauthorized" &&
         Platform.OS === "android" &&
-        !hasRequestedAndroidPermissions
+        !hasAskedAndroidPermissions
       ) {
-        hasRequestedAndroidPermissions = true;
         meshLog("lifecycle", "Requesting Bluetooth permissions");
-        await requestMeshPermissions().catch(() => false);
+        const permissionResult = await requestMeshPermissions();
+        hasAskedAndroidPermissions = permissionResult !== "unanswered";
+        meshLog("lifecycle", "Bluetooth permissions answered", {
+          permissionResult,
+        });
         bluetoothState = await BleBroadcast.getBluetoothStateAsync();
       }
 
